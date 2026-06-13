@@ -86,16 +86,27 @@ export function resolveXvfbRun(): string | null {
   return cachedXvfb;
 }
 
-function getVersion(bin: string): Promise<string | null> {
+function probeVersion(bin: string): Promise<{ version: string | null; detail: string }> {
   return new Promise((resolve) => {
-    const child = spawn(bin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
+    let spawnErr = "";
+    const child = spawn(bin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
     child.stdout.on("data", (c: Buffer) => (out += c.toString()));
     child.stderr.on("data", (c: Buffer) => (out += c.toString())); // OpenSCAD prints version to stderr
-    child.on("error", () => resolve(null));
-    child.on("close", () => {
+    child.on("error", (e: Error) => (spawnErr = e.message));
+    child.on("close", (code, signal) => {
       const match = out.match(/OpenSCAD version .*/i);
-      resolve(match ? match[0].trim() : out.trim().split(/\r?\n/)[0] || null);
+      if (match) return resolve({ version: match[0].trim(), detail: "" });
+      let detail = spawnErr || out.trim().split(/\r?\n/)[0] || "";
+      if (!detail && signal) {
+        detail =
+          `the binary was killed by signal ${signal} before producing output` +
+          (process.platform === "darwin"
+            ? " — on macOS this is almost always Gatekeeper blocking an unverified binary, " +
+              "or an Intel-only build running without Rosetta on Apple Silicon"
+            : "");
+      }
+      resolve({ version: null, detail: detail || `exited with code ${code}` });
     });
   });
 }
@@ -104,11 +115,24 @@ function getVersion(bin: string): Promise<string | null> {
 export async function probeEnvironment(): Promise<Probe> {
   const openscad = resolveOpenscad();
   const xvfbRun = resolveXvfbRun();
-  const version = openscad ? await getVersion(openscad).catch(() => null) : null;
+  const ver = openscad
+    ? await probeVersion(openscad).catch(() => ({ version: null, detail: "version probe threw" }))
+    : { version: null, detail: "" };
 
   const lines: string[] = [];
   if (openscad) {
-    lines.push(`OpenSCAD: ${openscad}${version ? ` — ${version}` : ""}`);
+    lines.push(`OpenSCAD: ${openscad}${ver.version ? ` — ${ver.version}` : ""}`);
+    if (!ver.version) {
+      lines.push(`  WARNING: found the binary but it would not run: ${ver.detail}`);
+      if (process.platform === "darwin") {
+        lines.push(
+          "  macOS fixes: (a) de-quarantine — xattr -dr com.apple.quarantine on the binary/app, " +
+            "or approve it in System Settings > Privacy & Security; " +
+            "(b) install Rosetta for Intel-only builds — softwareupdate --install-rosetta --agree-to-license; " +
+            "(c) or install a native arm64 build (e.g. a current OpenSCAD snapshot).",
+        );
+      }
+    }
   } else {
     lines.push("OpenSCAD: NOT FOUND.");
     lines.push(`  PATH seen by server: ${process.env.PATH ?? "<empty>"}`);
@@ -124,9 +148,9 @@ export async function probeEnvironment(): Promise<Probe> {
     );
   }
   return {
-    ok: !!openscad && (!NEEDS_DISPLAY || !!xvfbRun),
+    ok: !!openscad && !!ver.version && (!NEEDS_DISPLAY || !!xvfbRun),
     openscad,
-    version,
+    version: ver.version,
     xvfbRun,
     needsDisplay: NEEDS_DISPLAY,
     report: lines.join("\n"),
@@ -231,9 +255,20 @@ function execute(
         reject(err);
       }
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
-      resolve({ exitCode: code ?? -1, stderr });
+      let out = stderr;
+      if (code === null && signal) {
+        out +=
+          `\n[OpenSCAD was killed by signal ${signal} before finishing.` +
+          (process.platform === "darwin"
+            ? " On macOS this is typically Gatekeeper blocking an unverified binary, or an Intel-only " +
+              "build running without Rosetta on Apple Silicon. Fix: de-quarantine the binary " +
+              "(xattr -dr com.apple.quarantine <path>) / approve it in System Settings > Privacy & Security, " +
+              "or install Rosetta / a native arm64 build.]"
+            : "]");
+      }
+      resolve({ exitCode: code ?? -1, stderr: out });
     });
   });
 }
