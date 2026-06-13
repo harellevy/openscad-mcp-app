@@ -126,7 +126,9 @@ async function main() {
     assert(buf.subarray(1, 4).toString() === "PNG", "image data should decode to a PNG");
     await writeFile(path.join(RENDER_DIR, `view-${i}.png`), buf);
   }
-  console.log("PASS render_model:", textOf(render).split("\n")[0], `(PNGs in ${RENDER_DIR})`);
+  assert(Buffer.from(render.structuredContent?.stlBase64 ?? "", "base64").length > 84, "render_model should also return STL bytes for the inline viewer");
+  assert((render as any)._meta?.ui?.resourceUri === VIEWER_URI, "render_model should mount the inline viewer via _meta.ui.resourceUri");
+  console.log("PASS render_model (inline viewer + PNG fallback):", textOf(render).split("\n")[0], `(PNGs in ${RENDER_DIR})`);
 
   // 4. render_model honors -D parameter overrides
   const paramRender: any = await client.callTool({

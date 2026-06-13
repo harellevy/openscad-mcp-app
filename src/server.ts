@@ -152,10 +152,11 @@ export function createServer(): McpServer {
     {
       title: "Render OpenSCAD preview",
       description:
-        "Render OpenSCAD source to PNG preview image(s), returned inline so you can see the model and iterate. " +
-        "Call this after every meaningful code change. Request multiple views to inspect geometry from different sides. " +
-        "Uses fast OpenCSG preview by default; set full_render=true for slower, artifact-free CGAL rendering " +
-        "(useful when difference()/intersection() previews look wrong).",
+        "Render OpenSCAD source and mount it in an interactive 3D viewer inline in the chat (orbit/zoom), " +
+        "with PNG preview(s) as a fallback. Call this after every meaningful code change. " +
+        "Uses fast OpenCSG preview for the PNG by default; set full_render=true for slower, artifact-free CGAL " +
+        "rendering (useful when difference()/intersection() previews look wrong). The 3D panel is freely " +
+        "orbitable, so the camera views only affect the PNG fallback.",
       inputSchema: {
         code: codeSchema,
         code_path: codePathSchema,
@@ -197,6 +198,7 @@ export function createServer(): McpServer {
       const content: Array<TextBlock | ImageBlock> = [];
       let warnings: string[] = [];
       let totalMs = 0;
+      let firstPng = "";
 
       for (const view of viewList) {
         const args = [
@@ -219,21 +221,47 @@ export function createServer(): McpServer {
         }
         totalMs += result.durationMs;
         warnings = diagnostics(result.stderr); // identical across views; keep the latest
-        content.push({
-          type: "image",
-          data: result.output.toString("base64"),
-          mimeType: "image/png",
-        });
+        const pngB64 = result.output.toString("base64");
+        if (!firstPng) firstPng = pngB64;
+        content.push({ type: "image", data: pngB64, mimeType: "image/png" });
+      }
+
+      // Also export a mesh so the result mounts the inline interactive 3D viewer
+      // (free orbit/zoom — not just the fixed camera angles). The PNG(s) above
+      // stay as the fallback rung for hosts without MCP-Apps support. Best-effort:
+      // a mesh failure still returns the PNGs.
+      let structuredContent: Record<string, unknown> | undefined;
+      let viewerMeta: { ui: { resourceUri: string; visibility: string[] } } | undefined;
+      try {
+        const stl = await runOpenscad(src.code, "stl", defineArgs(parameters));
+        if (stl.exitCode === 0 && stl.output) {
+          structuredContent = {
+            kind: "3d",
+            state: "completed",
+            name: "model",
+            stats: `STL ${formatBytes(stl.output.length)}`,
+            stlBase64: stl.output.toString("base64"),
+            pngBase64: firstPng,
+          };
+          viewerMeta = { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } };
+        }
+      } catch {
+        /* mesh export is best-effort; the PNG fallback is still returned */
       }
 
       const summary = [
         `Rendered ${viewList.length} view(s) [${viewList.join(", ")}] at ${width}x${height} ` +
-          `(${full_render ? "full CGAL render" : "fast preview"}) in ${totalMs} ms.`,
+          `(${full_render ? "full CGAL render" : "fast preview"}) in ${totalMs} ms.` +
+          (viewerMeta ? " Interactive 3D viewer ready (orbit/zoom)." : ""),
         ...(warnings.length > 0 ? ["Diagnostics:", ...warnings] : []),
       ].join("\n");
       content.push({ type: "text", text: summary });
 
-      return { content };
+      return {
+        content,
+        ...(structuredContent ? { structuredContent } : {}),
+        ...(viewerMeta ? { _meta: viewerMeta } : {}),
+      };
     },
   );
 
