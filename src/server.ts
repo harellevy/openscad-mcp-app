@@ -91,14 +91,23 @@ export function createServer(): McpServer {
       inputSchema: {
         code: codeSchema,
         views: z
-          .array(z.enum(VIEW_NAMES))
-          .min(1)
-          .max(7)
+          .preprocess(
+            (v) => (typeof v === "string" ? [v] : v),
+            z.array(z.enum(VIEW_NAMES)),
+          )
           .default(["diagonal"])
-          .describe("Camera presets to render, one image per view."),
-        width: z.number().int().min(64).max(1920).default(800).describe("Image width in pixels."),
-        height: z.number().int().min(64).max(1920).default(600).describe("Image height in pixels."),
-        color_scheme: z.enum(COLOR_SCHEMES).default("Cornfield").describe("OpenSCAD color scheme."),
+          .describe(
+            "Camera preset(s) to render, one image per view. A single string is also accepted. " +
+              `Valid: ${VIEW_NAMES.join(", ")}.`,
+          ),
+        width: z.coerce.number().int().min(64).max(1920).default(800).describe("Image width in pixels."),
+        height: z.coerce.number().int().min(64).max(1920).default(600).describe("Image height in pixels."),
+        color_scheme: z
+          .string()
+          .optional()
+          .describe(
+            `OpenSCAD color scheme (unknown values fall back to Cornfield). Valid: ${COLOR_SCHEMES.join(", ")}.`,
+          ),
         full_render: z
           .boolean()
           .default(false)
@@ -107,11 +116,17 @@ export function createServer(): McpServer {
       },
     },
     async ({ code, views, width, height, color_scheme, full_render, parameters }) => {
+      // Be forgiving: dedupe views, cap at 7, fall back on an unknown color scheme.
+      const viewList = [...new Set(views as ViewName[])].slice(0, 7);
+      const scheme = (COLOR_SCHEMES as readonly string[]).includes(color_scheme ?? "")
+        ? (color_scheme as string)
+        : "Cornfield";
+
       const content: Array<TextBlock | ImageBlock> = [];
       let warnings: string[] = [];
       let totalMs = 0;
 
-      for (const view of views as ViewName[]) {
+      for (const view of viewList) {
         const args = [
           "--imgsize",
           `${width},${height}`,
@@ -120,7 +135,7 @@ export function createServer(): McpServer {
           "--autocenter",
           "--viewall",
           "--colorscheme",
-          color_scheme,
+          scheme,
           ...(full_render ? ["--render"] : []),
           ...defineArgs(parameters),
         ];
@@ -140,7 +155,7 @@ export function createServer(): McpServer {
       }
 
       const summary = [
-        `Rendered ${views.length} view(s) [${views.join(", ")}] at ${width}x${height} ` +
+        `Rendered ${viewList.length} view(s) [${viewList.join(", ")}] at ${width}x${height} ` +
           `(${full_render ? "full CGAL render" : "fast preview"}) in ${totalMs} ms.`,
         ...(warnings.length > 0 ? ["Diagnostics:", ...warnings] : []),
       ].join("\n");
@@ -159,7 +174,10 @@ export function createServer(): McpServer {
         "Runs a full geometry render. Call this once the previews look right.",
       inputSchema: {
         code: codeSchema,
-        format: z.enum(EXPORT_FORMATS).default("stl").describe("Output file format."),
+        format: z
+          .string()
+          .optional()
+          .describe(`Output file format (case-insensitive, default stl). Valid: ${EXPORT_FORMATS.join(", ")}.`),
         filename: z
           .string()
           .optional()
@@ -168,7 +186,12 @@ export function createServer(): McpServer {
       },
     },
     async ({ code, format, filename, parameters }) => {
-      const result = await runOpenscad(code, format, defineArgs(parameters));
+      const fmt = (format ?? "stl").toLowerCase().replace(/^\./, "");
+      if (!(EXPORT_FORMATS as readonly string[]).includes(fmt)) {
+        return errorResult(`Unknown format '${format}'. Valid: ${EXPORT_FORMATS.join(", ")}.`);
+      }
+
+      const result = await runOpenscad(code, fmt, defineArgs(parameters));
       if (result.exitCode !== 0 || !result.output) {
         return errorResult(`Export failed:\n${describeFailure(result.stderr)}`);
       }
@@ -177,7 +200,7 @@ export function createServer(): McpServer {
         .replace(/\.[A-Za-z0-9]+$/, "")
         .replace(/[^\w.-]+/g, "_") || "model";
       await mkdir(EXPORT_DIR, { recursive: true });
-      const outPath = path.join(EXPORT_DIR, `${stem}.${format}`);
+      const outPath = path.join(EXPORT_DIR, `${stem}.${fmt}`);
       await writeFile(outPath, result.output);
 
       const stats = result.stderr
@@ -185,7 +208,7 @@ export function createServer(): McpServer {
         .map((line) => line.trim())
         .filter((line) => /^(Top level object|Facets:|Vertices:|Simple:)/.test(line));
       const text = [
-        `Exported ${format.toUpperCase()} (${formatBytes(result.output.length)}) to ${outPath} in ${result.durationMs} ms.`,
+        `Exported ${fmt.toUpperCase()} (${formatBytes(result.output.length)}) to ${outPath} in ${result.durationMs} ms.`,
         ...stats,
         ...diagnostics(result.stderr),
       ].join("\n");

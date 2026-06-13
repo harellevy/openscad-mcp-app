@@ -85,6 +85,19 @@ async function main() {
   assert(!paramRender.isError, `param render should succeed, got: ${textOf(paramRender)}`);
   console.log("PASS render_model with -D parameters");
 
+  // 4c. render_model tolerates loose inputs: bare-string view, string-encoded
+  // numbers, and an unknown color scheme (should fall back, not error).
+  const loose: any = await client.callTool({
+    name: "render_model",
+    arguments: { code: DEMO, views: "front", width: "320", height: "240", color_scheme: "nope" },
+  });
+  assert(!loose.isError, `loose inputs should be tolerated, got: ${textOf(loose)}`);
+  assert(
+    (loose.content as any[]).filter((c) => c.type === "image").length === 1,
+    "expected 1 image from single-string view",
+  );
+  console.log("PASS render_model tolerant of loose inputs (string view/dims, bad scheme)");
+
   // 5. export_model writes an STL
   const exp: any = await client.callTool({
     name: "export_model",
@@ -93,6 +106,14 @@ async function main() {
   assert(!exp.isError, `export should succeed, got: ${textOf(exp)}`);
   assert(/Exported STL/.test(textOf(exp)), "export summary missing");
   console.log("PASS export_model:", textOf(exp).split("\n")[0]);
+
+  // 5b. export_model accepts case-insensitive format ("STL" -> stl)
+  const expUpper: any = await client.callTool({
+    name: "export_model",
+    arguments: { code: DEMO, format: "STL", filename: "smoke-upper" },
+  });
+  assert(!expUpper.isError, `uppercase format should work, got: ${textOf(expUpper)}`);
+  console.log("PASS export_model case-insensitive format");
 
   await client.close();
   console.log("\nALL SMOKE TESTS PASSED");
