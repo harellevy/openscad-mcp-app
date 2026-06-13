@@ -7,7 +7,7 @@ import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
 import { defineArgs, diagnostics, probeEnvironment, runOpenscad } from "./openscad.js";
 import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 
 // Default to a guaranteed-writable dir. The server's cwd when spawned by a host
 // (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
@@ -111,8 +111,16 @@ export function createServer(): McpServer {
     async () => {
       const probe = await probeEnvironment();
       const status = probe.ok ? "READY" : "NOT READY";
+      // Version + export dir make "am I running the new build?" answerable in one
+      // call: the old scaffold reports export dir "/exports"; >=0.2.0 reports a
+      // $TMPDIR path and includes view_model + the inline viewer.
+      const header =
+        `openscad-mcp v${SERVER_VERSION} (build with view_model + inline viewer)\n` +
+        `Export dir: ${EXPORT_DIR}`;
       return {
-        content: [{ type: "text", text: `OpenSCAD MCP environment: ${status}\n${probe.report}` } satisfies TextBlock],
+        content: [
+          { type: "text", text: `${header}\nOpenSCAD MCP environment: ${status}\n${probe.report}` } satisfies TextBlock,
+        ],
       };
     },
   );

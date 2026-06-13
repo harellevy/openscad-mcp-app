@@ -98,6 +98,8 @@ async function main() {
   assert(!diag.isError, `diagnose should not error, got: ${textOf(diag)}`);
   assert(/READY/.test(textOf(diag)), `diagnose should report READY, got: ${textOf(diag)}`);
   assert(/OpenSCAD: \//.test(textOf(diag)), "diagnose should report the resolved binary path");
+  assert(/openscad-mcp v\d/.test(textOf(diag)), "diagnose should report the server version (build verification)");
+  assert(/Export dir:/.test(textOf(diag)), "diagnose should report the active export dir (proves it's not /exports)");
   console.log("PASS diagnose:", textOf(diag).split("\n").slice(0, 2).join(" | "));
 
   // 1. check_model flags broken code
