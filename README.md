@@ -4,6 +4,29 @@ An MCP server for iterating on [OpenSCAD](https://openscad.org/) models **inline
 LLM writes OpenSCAD code, renders it through this server, sees the preview image directly in the
 conversation, and refines it — then exports an STL when the model is right.
 
+![The inline interactive 3D viewer rendering a model in chat, with Download STL / Download PNG buttons](docs/images/inline-viewer.png)
+
+## What is this?
+
+OpenSCAD is a *programmer's* CAD tool — you describe solids in code instead of pushing a mouse, which
+makes it a natural fit for an LLM: the model can author the geometry, you describe what's wrong, and
+it edits the source. The missing piece has always been the feedback loop. A language model writing
+CAD code blind is guessing; it needs to *see* what it built.
+
+This server closes that loop. It runs OpenSCAD on the assistant's behalf and pipes the result back
+**into the conversation** — a rendered preview, validation errors with line numbers, or an
+interactive 3D viewer you can orbit and zoom right in the chat window (screenshot above). So the
+workflow becomes a real design conversation:
+
+> *"Design a roller for a 608 bearing with a V-groove for 1.75 mm wire."* → the assistant writes
+> OpenSCAD, renders it, you both look at the same picture, you say *"deepen the groove and add a
+> shaft"*, it edits and re-renders — and when it's right, it exports a printable STL.
+
+It's built for both **Claude Desktop / claude.ai** (where you get the full inline interactive viewer
+via the HTTP transport) and **Claude Code** (where the assistant writes `.scad` files to disk and
+renders them by path). No geometry leaves your machine — OpenSCAD runs locally and the viewer is
+fully self-contained.
+
 ## Tools
 
 | Tool | What it does |
@@ -94,8 +117,38 @@ inline interactive viewer. (Run only one at a time to avoid two servers competin
    appears inline) → you comment on what's wrong → it fixes the code and re-renders.
 3. When it looks right: `export_model` → STL lands in `./exports/` (or `OPENSCAD_MCP_EXPORT_DIR`).
 
-Try the demo model: `examples/enclosure.scad` — a fully parameterized two-part electronics
-enclosure.
+## Examples
+
+Two worked models live in [`examples/`](examples/). Ask the assistant to render one, then iterate on
+it — change a parameter, deepen a pocket, add a mounting tab — and watch it update inline.
+
+### `wire_straightener.scad` — 608-bearing roller wire straightener
+
+A staggered-roller jig that pulls the curl out of filament/wire as it's fed through 608 bearings.
+Fully parametric: bearing size, roller count, pitch, and travel are all variables at the top of the
+file. Render the whole assembly or any single printable part via the `part` parameter
+(`assembly` · `body` · `carriage` · `knob`):
+
+```
+render_model  code_path=examples/wire_straightener.scad                          # full assembly (default)
+render_model  code_path=examples/wire_straightener.scad  parameters={ part: "body" }
+```
+
+The grooved bearing-and-shaft render at the top of this README is exactly what the inline viewer
+shows for a model like this — note the `Download STL` / `Download PNG` buttons, so the geometry is
+right there to print.
+
+### `enclosure.scad` — parametric two-part electronics enclosure
+
+A fully parameterized snap-together project box: set the inner cavity, wall thickness, and lid
+clearance, and it generates the matching base and lid (`part` = `base` · `lid` · `both`). A good
+demonstration of driving a design purely through `parameters` (`-D` overrides) without resending
+source.
+
+```
+render_model  code_path=examples/enclosure.scad  parameters={ inner_l: 60, inner_w: 40 }
+render_model  code_path=examples/enclosure.scad  parameters={ part: "lid" }
+```
 
 ## Troubleshooting: `'openscad' was not found` / `cannot run OpenSCAD`
 
