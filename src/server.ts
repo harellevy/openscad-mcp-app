@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
@@ -8,8 +9,11 @@ import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
 const SERVER_VERSION = "0.1.0";
 
+// Default to a guaranteed-writable dir. The server's cwd when spawned by a host
+// (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
+// unwritable "/exports". Bytes are returned in the result regardless of disk.
 const EXPORT_DIR =
-  process.env.OPENSCAD_MCP_EXPORT_DIR ?? path.join(process.cwd(), "exports");
+  process.env.OPENSCAD_MCP_EXPORT_DIR ?? path.join(tmpdir(), "openscad-mcp-exports");
 
 const COLOR_SCHEMES = [
   "Cornfield",
@@ -239,7 +243,8 @@ export function createServer(): McpServer {
       title: "Export OpenSCAD model",
       description:
         "Export the model as a mesh/solid file (STL, OFF, AMF, 3MF, or CSG) for 3D printing or further processing. " +
-        "Runs a full geometry render. Call this once the previews look right.",
+        "Runs a full geometry render. Call this once the previews look right. STL exports also open in the " +
+        "interactive 3D viewer (rotate/zoom + a download button); the mesh bytes are returned regardless of disk.",
       inputSchema: {
         code: codeSchema,
         code_path: codePathSchema,
@@ -255,37 +260,82 @@ export function createServer(): McpServer {
       },
     },
     async ({ code, code_path, format, filename, parameters }) => {
-      const src = await resolveSource(code, code_path);
-      if ("error" in src) return errorResult(src.error);
+      try {
+        const src = await resolveSource(code, code_path);
+        if ("error" in src) return errorResult(src.error);
 
-      const fmt = (format ?? "stl").toLowerCase().replace(/^\./, "");
-      if (!(EXPORT_FORMATS as readonly string[]).includes(fmt)) {
-        return errorResult(`Unknown format '${format}'. Valid: ${EXPORT_FORMATS.join(", ")}.`);
+        const fmt = (format ?? "stl").toLowerCase().replace(/^\./, "");
+        if (!(EXPORT_FORMATS as readonly string[]).includes(fmt)) {
+          return errorResult(`Unknown format '${format}'. Valid: ${EXPORT_FORMATS.join(", ")}.`);
+        }
+
+        const result = await runOpenscad(src.code, fmt, defineArgs(parameters));
+        if (result.exitCode !== 0 || !result.output) {
+          return errorResult(`Export failed:\n${describeFailure(result.stderr)}`);
+        }
+
+        const stem = (filename ? path.basename(filename) : `model-${Date.now()}`)
+          .replace(/\.[A-Za-z0-9]+$/, "")
+          .replace(/[^\w.-]+/g, "_") || "model";
+
+        // Best-effort disk write — never throw if the dir is read-only; the bytes
+        // are returned in the result either way (works in any sandbox).
+        let savedTo: string | null = null;
+        let saveError: string | null = null;
+        try {
+          await mkdir(EXPORT_DIR, { recursive: true });
+          savedTo = path.join(EXPORT_DIR, `${stem}.${fmt}`);
+          await writeFile(savedTo, result.output);
+        } catch (e) {
+          savedTo = null;
+          saveError = (e as Error).message;
+        }
+
+        const meshStats = result.stderr
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => /^(Top level object|Facets:|Vertices:|Simple:)/.test(line));
+        const text = [
+          `Exported ${fmt.toUpperCase()} (${formatBytes(result.output.length)}) in ${result.durationMs} ms.`,
+          savedTo
+            ? `Saved to ${savedTo}`
+            : `Not written to disk (${saveError}). Use the viewer's Download button (STL) or the returned bytes.`,
+          ...meshStats,
+          ...diagnostics(result.stderr),
+        ].join("\n");
+
+        const base64 = result.output.toString("base64");
+        const structuredContent: Record<string, unknown> = {
+          kind: fmt === "stl" ? "3d" : "file",
+          state: "completed",
+          name: stem,
+          format: fmt,
+          savedTo,
+          stats: `${fmt.toUpperCase()} ${formatBytes(result.output.length)}`,
+        };
+        // STL feeds the inline 3D viewer (rotate/zoom + download, no disk needed).
+        // For other formats, only carry the bytes if the disk write failed, to
+        // avoid bloating model context on hosts that surface structuredContent.
+        if (fmt === "stl") structuredContent.stlBase64 = base64;
+        else if (!savedTo) structuredContent.fileBase64 = base64;
+
+        const out: {
+          content: TextBlock[];
+          structuredContent: Record<string, unknown>;
+          _meta?: Record<string, unknown>;
+        } = {
+          content: [{ type: "text", text }],
+          structuredContent,
+        };
+        if (fmt === "stl") {
+          out._meta = { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } };
+        }
+        return out;
+      } catch (e) {
+        // Defensive: a thrown error (timeout, kill, fs) returns a clean result
+        // instead of bubbling up and risking the session.
+        return errorResult(`export_model failed: ${(e as Error).message}`);
       }
-
-      const result = await runOpenscad(src.code, fmt, defineArgs(parameters));
-      if (result.exitCode !== 0 || !result.output) {
-        return errorResult(`Export failed:\n${describeFailure(result.stderr)}`);
-      }
-
-      const stem = (filename ? path.basename(filename) : `model-${Date.now()}`)
-        .replace(/\.[A-Za-z0-9]+$/, "")
-        .replace(/[^\w.-]+/g, "_") || "model";
-      await mkdir(EXPORT_DIR, { recursive: true });
-      const outPath = path.join(EXPORT_DIR, `${stem}.${fmt}`);
-      await writeFile(outPath, result.output);
-
-      const stats = result.stderr
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => /^(Top level object|Facets:|Vertices:|Simple:)/.test(line));
-      const text = [
-        `Exported ${fmt.toUpperCase()} (${formatBytes(result.output.length)}) to ${outPath} in ${result.durationMs} ms.`,
-        ...stats,
-        ...diagnostics(result.stderr),
-      ].join("\n");
-
-      return { content: [{ type: "text", text } satisfies TextBlock] };
     },
   );
 

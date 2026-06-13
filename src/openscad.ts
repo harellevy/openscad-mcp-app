@@ -231,11 +231,15 @@ function execute(
   env: NodeJS.ProcessEnv,
 ): Promise<{ exitCode: number; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], env });
+    // detached:true makes the child a process-group leader so we can kill the
+    // whole tree (xvfb-run + Xvfb + openscad) on timeout — otherwise a runaway
+    // CGAL render survives as an orphan and wedges the server.
+    const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"], env, detached: true });
     let stderr = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`OpenSCAD timed out after ${TIMEOUT_MS} ms`));
+      try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { /* group already gone */ }
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      reject(new Error(`OpenSCAD timed out after ${TIMEOUT_MS} ms (process group killed)`));
     }, TIMEOUT_MS);
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();

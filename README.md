@@ -120,7 +120,7 @@ After changing the install or config, **restart the MCP client** so it respawns 
 | Env var | Default | Purpose |
 |---|---|---|
 | `OPENSCAD_PATH` | `openscad` | Path to the OpenSCAD binary |
-| `OPENSCAD_MCP_EXPORT_DIR` | `./exports` | Where `export_model` writes files |
+| `OPENSCAD_MCP_EXPORT_DIR` | `$TMPDIR/openscad-mcp-exports` | Where `export_model` writes files (always a writable dir). The mesh bytes are returned in the result regardless, so a read-only sandbox still works; set this to e.g. `~/Desktop` to collect files. |
 | `OPENSCAD_TIMEOUT_MS` | `120000` | Per-invocation timeout |
 
 ## Development

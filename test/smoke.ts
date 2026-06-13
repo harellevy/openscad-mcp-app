@@ -40,6 +40,16 @@ async function main() {
   const client = new Client({ name: "smoke-test", version: "0.0.0" });
   await client.connect(transport);
 
+  // A second server instance whose export dir can never be created (its parent
+  // is a file → ENOTDIR even as root), to prove export survives an unwritable dir.
+  const roTransport = new StdioClientTransport({
+    command: "node",
+    args: ["dist/index.js"],
+    env: { ...process.env, OPENSCAD_MCP_EXPORT_DIR: "/etc/hostname/exports" },
+  });
+  const roClient = new Client({ name: "smoke-test-ro", version: "0.0.0" });
+  await roClient.connect(roTransport);
+
   // Tool discovery
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
@@ -171,16 +181,28 @@ async function main() {
   assert(/code_path/.test(textOf(missing)), "error should mention code_path");
   console.log("PASS render_model reports missing source clearly");
 
-  // 5. export_model writes an STL
+  // 5. export_model writes an STL AND returns the bytes + viewer link
   const exp: any = await client.callTool({
     name: "export_model",
     arguments: { code: DEMO, format: "stl", filename: "smoke-bracket" },
   });
   assert(!exp.isError, `export should succeed, got: ${textOf(exp)}`);
   assert(/Exported STL/.test(textOf(exp)), "export summary missing");
-  console.log("PASS export_model:", textOf(exp).split("\n")[0]);
+  assert(Buffer.from(exp.structuredContent?.stlBase64 ?? "", "base64").length > 84, "export must return STL bytes in structuredContent");
+  assert((exp as any)._meta?.ui?.resourceUri === VIEWER_URI, "STL export should link the inline viewer");
+  console.log("PASS export_model (bytes + viewer):", textOf(exp).split("\n")[0]);
 
-  // 5b. export_model accepts case-insensitive format ("STL" -> stl)
+  // 5b. export_model survives a read-only export dir (bytes still returned)
+  const expRO: any = await roClient.callTool({
+    name: "export_model",
+    arguments: { code: DEMO, format: "stl", filename: "smoke-ro" },
+  });
+  assert(!expRO.isError, `export must not fail on an unwritable dir, got: ${textOf(expRO)}`);
+  assert(Buffer.from(expRO.structuredContent?.stlBase64 ?? "", "base64").length > 84, "bytes must be returned even when disk write fails");
+  assert(/Not written to disk/.test(textOf(expRO)), "should note the disk write failure");
+  console.log("PASS export_model resilient to read-only dir");
+
+  // 5c. export_model accepts case-insensitive format ("STL" -> stl)
   const expUpper: any = await client.callTool({
     name: "export_model",
     arguments: { code: DEMO, format: "STL", filename: "smoke-upper" },
@@ -189,6 +211,7 @@ async function main() {
   console.log("PASS export_model case-insensitive format");
 
   await client.close();
+  await roClient.close();
   console.log("\nALL SMOKE TESTS PASSED");
 }
 
