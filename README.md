@@ -69,6 +69,24 @@ claude mcp add openscad -- node /absolute/path/to/openscad-mcp-app/dist/index.js
 }
 ```
 
+## The inline 3D viewer needs the HTTP transport
+
+The tools work over **stdio** (the config above), but the **inline interactive 3D viewer**
+(`view_model` / the MCP-App iframe) frequently does **not** render over stdio in Claude Desktop —
+the iframe handshake never completes ([ext-apps#671](https://github.com/modelcontextprotocol/ext-apps/issues/671),
+[claude-ai-mcp#165](https://github.com/anthropics/claude-ai-mcp/issues/165)). The inline-UI path is
+exercised over **Streamable HTTP**, the same transport remote MCP servers/connectors use. To get the
+orbit/zoom viewer, run the HTTP server and add it as a **custom connector**:
+
+```sh
+npm run build
+npm run start:http          # listens on http://localhost:3333/mcp  (set PORT to change)
+```
+
+Then in Claude Desktop / claude.ai: **Settings → Connectors → Add custom connector**, URL
+`http://localhost:3333/mcp`. Over stdio you still get tools + the PNG preview; over HTTP you get the
+inline interactive viewer. (Run only one at a time to avoid two servers competing.)
+
 ## The iteration loop
 
 1. Ask for a model ("design a parametric enclosure for a 60×40 mm PCB").

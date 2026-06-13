@@ -8,7 +8,7 @@ import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
 import { defineArgs, diagnostics, probeEnvironment, runOpenscad, toBinaryStl } from "./openscad.js";
 import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
-const SERVER_VERSION = "0.2.1";
+const SERVER_VERSION = "0.2.2";
 
 // Default to a guaranteed-writable dir. The server's cwd when spawned by a host
 // (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
@@ -243,6 +243,7 @@ export function createServer(): McpServer {
           .describe("Force a full CGAL render instead of the fast preview."),
         parameters: parametersSchema,
       },
+      _meta: { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } },
     },
     async ({ code, code_path, views, width, height, color_scheme, full_render, parameters }) => {
       const src = await resolveSource(code, code_path);
@@ -349,6 +350,7 @@ export function createServer(): McpServer {
           .describe("Output file name (basename only; extension is forced to match format)."),
         parameters: parametersSchema,
       },
+      _meta: { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } },
     },
     async ({ code, code_path, format, filename, parameters }) => {
       try {
