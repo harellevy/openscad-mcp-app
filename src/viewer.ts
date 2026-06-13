@@ -82,10 +82,24 @@ export function buildViewerHtml(): string {
     for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
     return bytes;
   }
-  function download(name, mime, b64) {
-    var a = document.createElement('a');
-    a.href = 'data:' + mime + ';base64,' + b64;
-    a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  function downloadBytes(name, mime, bytes) {
+    var blob = new Blob([bytes], { type: mime });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a'); a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+  }
+  function gunzip(bytes) {
+    if (typeof DecompressionStream === 'undefined') return Promise.reject(new Error('gzip unsupported here'));
+    var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return new Response(stream).arrayBuffer();
+  }
+  // Mesh arrives as compact binary STL (stlBase64) or gzipped binary
+  // (stlGzipBase64, inflated natively); resolve to an ArrayBuffer either way.
+  function stlBufferOf(model) {
+    if (model.stlBase64) return Promise.resolve(b64ToBytes(model.stlBase64).buffer);
+    if (model.stlGzipBase64) return gunzip(b64ToBytes(model.stlGzipBase64));
+    return Promise.resolve(null);
   }
   function showPng(b64, msg) {
     if (b64) { pngEl.src = 'data:image/png;base64,' + b64; fallbackEl.style.display = 'flex'; }
@@ -97,21 +111,30 @@ export function buildViewerHtml(): string {
     if (!model) return;
     nameEl.textContent = model.name || 'model';
     statsEl.textContent = model.stats || '';
-    if (model.pngBase64) { dlPng.disabled = false; dlPng.onclick = function () {
-      download((model.name || 'model') + '.png', 'image/png', model.pngBase64); }; }
-    if (model.stlBase64) { dlStl.disabled = false; dlStl.onclick = function () {
-      download((model.name || 'model') + '.stl', 'model/stl', model.stlBase64); }; }
-
-    if (model.stlBase64 && render3D) {
-      try {
-        render3D(b64ToBytes(model.stlBase64).buffer);
-        fallbackEl.style.display = 'none'; statusEl.textContent = ''; reportSize();
-      } catch (e) { showPng(model.pngBase64, '3D render failed: ' + e.message); }
-    } else if (model.stlBase64 && !render3D) {
-      pending = model;
-    } else {
-      showPng(model.pngBase64, model.pngBase64 ? '' : 'Model has no preview data.');
+    if (model.pngBase64) {
+      dlPng.disabled = false;
+      dlPng.onclick = function () { downloadBytes((model.name || 'model') + '.png', 'image/png', b64ToBytes(model.pngBase64)); };
     }
+    stlBufferOf(model).then(function (stlBuf) {
+      if (stlBuf) {
+        dlStl.disabled = false;
+        dlStl.onclick = function () { downloadBytes((model.name || 'model') + '.stl', 'model/stl', stlBuf); };
+      }
+      if (stlBuf && render3D) {
+        try {
+          render3D(stlBuf);
+          fallbackEl.style.display = 'none'; statusEl.textContent = ''; reportSize();
+        } catch (e) { showPng(model.pngBase64, '3D render failed: ' + e.message); }
+      } else if (stlBuf && !render3D) {
+        pending = model; // renderer not ready yet
+      } else {
+        showPng(model.pngBase64, model.meshOmitted
+          ? ('Model too large for inline 3D (' + (model.tris || '?') + ' triangles) — showing image. Use export_model to download the STL.')
+          : (model.pngBase64 ? '' : 'Model has no preview data.'));
+      }
+    }, function (e) {
+      showPng(model.pngBase64, 'Could not decode mesh (' + e.message + ') — showing image.');
+    });
   }
 
   /* ---- MCP Apps host messaging (JSON-RPC 2.0 over postMessage) ---- */

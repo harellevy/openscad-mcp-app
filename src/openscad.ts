@@ -176,6 +176,50 @@ export function diagnostics(stderr: string): string[] {
     .filter((line) => /^(ERROR|WARNING|TRACE|ECHO)\b/i.test(line));
 }
 
+/** Triangle vertices (flat: 9 numbers per triangle) from an ASCII or binary STL. */
+export function parseStlTriangles(buf: Buffer): number[] {
+  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  const dv = new DataView(ab);
+  const looksBinary = buf.length >= 84 && 84 + dv.getUint32(80, true) * 50 === buf.length;
+  const out: number[] = [];
+  if (looksBinary) {
+    const n = dv.getUint32(80, true);
+    let off = 84;
+    for (let i = 0; i < n; i++) {
+      off += 12; // stored normal
+      for (let k = 0; k < 3; k++) {
+        out.push(dv.getFloat32(off, true), dv.getFloat32(off + 4, true), dv.getFloat32(off + 8, true));
+        off += 12;
+      }
+      off += 2; // attribute byte count
+    }
+  } else {
+    const re = /vertex\s+(\S+)\s+(\S+)\s+(\S+)/g;
+    const txt = buf.toString("utf8");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(txt))) out.push(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]));
+  }
+  return out;
+}
+
+/** Re-encode any STL as compact binary STL (normals left zero; viewers recompute). */
+export function toBinaryStl(buf: Buffer): Buffer {
+  const v = parseStlTriangles(buf);
+  const n = Math.floor(v.length / 9);
+  const out = Buffer.alloc(84 + n * 50); // zero-filled: header, normals, attrs all 0
+  out.writeUInt32LE(n, 80);
+  let off = 84;
+  for (let i = 0; i < n; i++) {
+    off += 12; // normal stays 0,0,0
+    for (let j = 0; j < 9; j++) {
+      out.writeFloatLE(v[i * 9 + j], off);
+      off += 4;
+    }
+    off += 2; // attribute byte count stays 0
+  }
+  return out;
+}
+
 /**
  * Run OpenSCAD over `code`, producing a single output file with extension
  * `outExt`. PNG rendering needs an OpenGL context, so on headless Linux the

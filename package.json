@@ -1,6 +1,6 @@
 {
   "name": "openscad-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server for iterating on OpenSCAD models inline in chat: render previews, check code, export meshes.",
   "type": "module",
   "main": "dist/index.js",

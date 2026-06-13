@@ -2,12 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { gzipSync } from "node:zlib";
 import { z } from "zod";
 import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
-import { defineArgs, diagnostics, probeEnvironment, runOpenscad } from "./openscad.js";
+import { defineArgs, diagnostics, probeEnvironment, runOpenscad, toBinaryStl } from "./openscad.js";
 import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 
 // Default to a guaranteed-writable dir. The server's cwd when spawned by a host
 // (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
@@ -92,6 +93,56 @@ async function resolveSource(
   return {
     error: "Provide either `code` (OpenSCAD source) or `code_path` (path to a .scad file).",
   };
+}
+
+type ViewerFields = { stlBase64?: string; stlGzipBase64?: string; meshOmitted?: boolean; tris?: number };
+
+/**
+ * Compact, size-bounded mesh for the viewer's structuredContent. OpenSCAD emits
+ * ASCII STL (~5x bigger than binary); we re-encode to binary, gzip if still
+ * large (the iframe inflates natively via DecompressionStream), and omit the
+ * mesh entirely when genuinely huge so the result can't exceed the host's cap.
+ */
+function meshPayload(stlOutput: Buffer): ViewerFields {
+  const bin = toBinaryStl(stlOutput);
+  const tris = Math.max(0, Math.round((bin.length - 84) / 50));
+  const b64 = bin.toString("base64");
+  if (b64.length <= 600_000) return { stlBase64: b64 };
+  const gz = gzipSync(bin).toString("base64");
+  if (gz.length <= 700_000) return { stlGzipBase64: gz };
+  return { meshOmitted: true, tris };
+}
+
+/**
+ * Hard guarantee the serialized tool result stays under the host's 1MB limit,
+ * shedding the heaviest / most-redundant payload first: mesh → extra view
+ * images → the structuredContent PNG → remaining images.
+ */
+function clampResult<T extends { content: Array<{ type: string }>; structuredContent?: Record<string, unknown> }>(
+  result: T,
+): T {
+  const LIMIT = 950_000;
+  const size = () => Buffer.byteLength(JSON.stringify(result));
+  if (size() <= LIMIT) return result;
+  const sc = result.structuredContent;
+  if (sc && (sc.stlBase64 || sc.stlGzipBase64 || sc.fileBase64)) {
+    delete sc.stlBase64;
+    delete sc.stlGzipBase64;
+    delete sc.fileBase64;
+    sc.meshOmitted = true;
+    if (size() <= LIMIT) return result;
+  }
+  const images = result.content.filter((c) => c.type === "image");
+  if (images.length > 1) {
+    result.content = [images[0], ...result.content.filter((c) => c.type !== "image")];
+    if (size() <= LIMIT) return result;
+  }
+  if (sc && sc.pngBase64) {
+    delete sc.pngBase64;
+    if (size() <= LIMIT) return result;
+  }
+  result.content = result.content.filter((c) => c.type !== "image");
+  return result;
 }
 
 export function createServer(): McpServer {
@@ -240,16 +291,19 @@ export function createServer(): McpServer {
       // a mesh failure still returns the PNGs.
       let structuredContent: Record<string, unknown> | undefined;
       let viewerMeta: { ui: { resourceUri: string; visibility: string[] } } | undefined;
+      let meshOmitted = false;
       try {
         const stl = await runOpenscad(src.code, "stl", defineArgs(parameters));
         if (stl.exitCode === 0 && stl.output) {
+          const mesh = meshPayload(stl.output);
+          meshOmitted = !!mesh.meshOmitted;
           structuredContent = {
             kind: "3d",
             state: "completed",
             name: "model",
             stats: `STL ${formatBytes(stl.output.length)}`,
-            stlBase64: stl.output.toString("base64"),
             pngBase64: firstPng,
+            ...mesh,
           };
           viewerMeta = { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } };
         }
@@ -260,16 +314,17 @@ export function createServer(): McpServer {
       const summary = [
         `Rendered ${viewList.length} view(s) [${viewList.join(", ")}] at ${width}x${height} ` +
           `(${full_render ? "full CGAL render" : "fast preview"}) in ${totalMs} ms.` +
-          (viewerMeta ? " Interactive 3D viewer ready (orbit/zoom)." : ""),
+          (viewerMeta && !meshOmitted ? " Interactive 3D viewer ready (orbit/zoom)." : "") +
+          (meshOmitted ? " (Model too large for inline 3D — showing image; export_model for the STL.)" : ""),
         ...(warnings.length > 0 ? ["Diagnostics:", ...warnings] : []),
       ].join("\n");
       content.push({ type: "text", text: summary });
 
-      return {
+      return clampResult({
         content,
         ...(structuredContent ? { structuredContent } : {}),
         ...(viewerMeta ? { _meta: viewerMeta } : {}),
-      };
+      });
     },
   );
 
@@ -340,7 +395,6 @@ export function createServer(): McpServer {
           ...diagnostics(result.stderr),
         ].join("\n");
 
-        const base64 = result.output.toString("base64");
         const structuredContent: Record<string, unknown> = {
           kind: fmt === "stl" ? "3d" : "file",
           state: "completed",
@@ -349,11 +403,15 @@ export function createServer(): McpServer {
           savedTo,
           stats: `${fmt.toUpperCase()} ${formatBytes(result.output.length)}`,
         };
-        // STL feeds the inline 3D viewer (rotate/zoom + download, no disk needed).
-        // For other formats, only carry the bytes if the disk write failed, to
-        // avoid bloating model context on hosts that surface structuredContent.
-        if (fmt === "stl") structuredContent.stlBase64 = base64;
-        else if (!savedTo) structuredContent.fileBase64 = base64;
+        // STL feeds the inline 3D viewer (compact binary, rotate/zoom + download,
+        // no disk needed). For other formats, only carry the bytes if the disk
+        // write failed AND they're small enough to inline safely.
+        if (fmt === "stl") {
+          Object.assign(structuredContent, meshPayload(result.output));
+        } else if (!savedTo) {
+          const b64 = result.output.toString("base64");
+          if (b64.length <= 600_000) structuredContent.fileBase64 = b64;
+        }
 
         const out: {
           content: TextBlock[];
@@ -366,7 +424,7 @@ export function createServer(): McpServer {
         if (fmt === "stl") {
           out._meta = { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } };
         }
-        return out;
+        return clampResult(out);
       } catch (e) {
         // Defensive: a thrown error (timeout, kill, fs) returns a clean result
         // instead of bubbling up and risking the session.
@@ -450,29 +508,32 @@ export function createServer(): McpServer {
       const stem = (name ? name : "model").replace(/[^\w.-]+/g, "_") || "model";
       const stats = `STL ${formatBytes(stl.output.length)}, rendered in ${png.durationMs + stl.durationMs} ms`;
       const warnings = diagnostics(png.stderr).concat(diagnostics(stl.stderr));
+      const mesh = meshPayload(stl.output);
 
       // structuredContent is the channel the host pushes to the iframe (it is not
       // shown to the model); _meta.ui links the tool to its UI resource.
-      return {
-        content: [
-          { type: "image", data: png.output.toString("base64"), mimeType: "image/png" },
-          {
-            type: "text",
-            text:
-              `Interactive 3D viewer ready for "${stem}" (rotate/zoom + download in the panel). ${stats}.` +
-              (warnings.length > 0 ? `\nDiagnostics:\n${warnings.join("\n")}` : ""),
-          },
-        ],
+      const content: Array<TextBlock | ImageBlock> = [
+        { type: "image", data: png.output.toString("base64"), mimeType: "image/png" },
+        {
+          type: "text",
+          text:
+            `Interactive 3D viewer ready for "${stem}" (rotate/zoom + download in the panel). ${stats}.` +
+            (mesh.meshOmitted ? " (Model too large for inline 3D — showing the image instead.)" : "") +
+            (warnings.length > 0 ? `\nDiagnostics:\n${warnings.join("\n")}` : ""),
+        },
+      ];
+      return clampResult({
+        content,
         structuredContent: {
           kind: "3d",
           state: "completed",
           name: stem,
           stats: stats,
-          stlBase64: stl.output.toString("base64"),
           pngBase64: png.output.toString("base64"),
+          ...mesh,
         },
         _meta: { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } },
-      };
+      });
     },
   );
 

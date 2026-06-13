@@ -86,12 +86,31 @@ async function main() {
   assert(!viewed.isError, `view_model should succeed, got: ${textOf(viewed)}`);
   assert((viewed.content as any[]).some((c) => c.type === "image"), "view_model should include a PNG fallback image");
   const payload = viewed.structuredContent;
-  assert(payload?.stlBase64 && payload?.pngBase64, "view_model structuredContent missing stl/png payload");
+  assert((payload?.stlBase64 || payload?.stlGzipBase64) && payload?.pngBase64, "view_model structuredContent missing mesh/png payload");
   assert((viewed as any)._meta?.ui?.resourceUri === VIEWER_URI, "view_model result _meta.ui.resourceUri missing");
+  // The mesh must be compact BINARY STL (not the ~5x-larger ASCII OpenSCAD emits).
   const stlBytes = Buffer.from(payload.stlBase64, "base64");
-  assert(stlBytes.length > 84, "decoded STL too small to be valid");
+  assert(stlBytes.length > 84 && 84 + stlBytes.readUInt32LE(80) * 50 === stlBytes.length, "mesh payload is not valid binary STL");
   assert(Buffer.from(payload.pngBase64, "base64").subarray(1, 4).toString() === "PNG", "png payload is not a PNG");
-  console.log("PASS view_model 3D payload:", `${stlBytes.length}-byte STL + PNG in _meta`);
+  assert(Buffer.byteLength(JSON.stringify(viewed)) < 1_000_000, "view_model result must stay under the 1MB host limit");
+  console.log("PASS view_model 3D payload:", `${stlBytes.length}-byte binary STL, result ${(Buffer.byteLength(JSON.stringify(viewed)) / 1024 | 0)}KB`);
+
+  // A real, non-trivial model must stay under the 1MB host cap (binary + gzip +
+  // clamp path) — this is the "Tool result is too large" regression guard.
+  const big: any = await client.callTool({
+    name: "view_model",
+    arguments: { code_path: path.resolve("examples/wire_straightener.scad"), name: "wire", width: 400, height: 300 },
+  });
+  assert(!big.isError, `view_model on a large model must not error, got: ${textOf(big)}`);
+  const bigSize = Buffer.byteLength(JSON.stringify(big));
+  assert(bigSize < 1_000_000, `large-model result must stay under 1MB, was ${bigSize} bytes`);
+  const bsc = big.structuredContent;
+  assert(bsc?.stlBase64 || bsc?.stlGzipBase64 || bsc?.meshOmitted, "large model should carry a mesh or be flagged meshOmitted");
+  console.log(
+    "PASS view_model large model under 1MB:",
+    `${(bigSize / 1024) | 0}KB`,
+    bsc?.stlBase64 ? "(binary)" : bsc?.stlGzipBase64 ? "(gzip)" : "(mesh omitted)",
+  );
 
   // 0. diagnose reports a ready environment here
   const diag: any = await client.callTool({ name: "diagnose", arguments: {} });
@@ -130,6 +149,7 @@ async function main() {
   }
   assert(Buffer.from(render.structuredContent?.stlBase64 ?? "", "base64").length > 84, "render_model should also return STL bytes for the inline viewer");
   assert((render as any)._meta?.ui?.resourceUri === VIEWER_URI, "render_model should mount the inline viewer via _meta.ui.resourceUri");
+  assert(Buffer.byteLength(JSON.stringify(render)) < 1_000_000, "render_model result must stay under the 1MB host limit");
   console.log("PASS render_model (inline viewer + PNG fallback):", textOf(render).split("\n")[0], `(PNGs in ${RENDER_DIR})`);
 
   // 4. render_model honors -D parameter overrides
