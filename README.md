@@ -75,6 +75,42 @@ claude mcp add openscad -- node /absolute/path/to/openscad-mcp-app/dist/index.js
 Try the demo model: `examples/enclosure.scad` — a fully parameterized two-part electronics
 enclosure.
 
+## Troubleshooting: `'openscad' was not found` / `cannot run OpenSCAD`
+
+The server process must be able to execute the OpenSCAD binary. If tools fail with a not-found error
+(even `check_model`, which needs no display), the binary isn't reachable from the **server's**
+environment — which is often not the same as your interactive shell.
+
+1. **Ask the server** — call the `diagnose` tool (or read the server's stderr at startup). It prints
+   whether OpenSCAD was found, the resolved path + version, the `PATH` the server actually sees, and
+   every location it probed.
+2. **Confirm the install really landed where the server runs.** In that same container/host:
+   `which openscad && openscad --version`. If that fails, the install didn't take there (a different
+   container, or `apt-get` errored) — fix that first.
+3. **PATH mismatch** — if `which openscad` works in your shell but the server still can't find it, the
+   stdio server inherited a minimal PATH from its host (common with Claude Desktop, Homebrew, app
+   bundles). The server now auto-probes `/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, `/snap/bin`,
+   and the macOS app bundle. If your binary is elsewhere, set `OPENSCAD_PATH` to its absolute path in
+   the MCP config's `env`.
+4. **`check_model` works but `render_model` fails on headless Linux** → it's the display, not your
+   code. PNG rendering needs a GL context; install `xvfb` (the server wraps OpenSCAD in `xvfb-run`
+   automatically). `export_model` and `check_model` don't need it.
+
+```jsonc
+// MCP config with an explicit binary path (Claude Desktop / Claude Code)
+{
+  "mcpServers": {
+    "openscad": {
+      "command": "node",
+      "args": ["/absolute/path/to/openscad-mcp-app/dist/index.js"],
+      "env": { "OPENSCAD_PATH": "/Applications/OpenSCAD.app/Contents/MacOS/OpenSCAD" }
+    }
+  }
+}
+```
+
+After changing the install or config, **restart the MCP client** so it respawns the server.
+
 ## Configuration
 
 | Env var | Default | Purpose |

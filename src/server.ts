@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
-import { defineArgs, diagnostics, runOpenscad } from "./openscad.js";
+import { defineArgs, diagnostics, probeEnvironment, runOpenscad } from "./openscad.js";
 
 const SERVER_VERSION = "0.1.0";
 
@@ -91,6 +91,26 @@ async function resolveSource(
 
 export function createServer(): McpServer {
   const server = new McpServer({ name: "openscad-mcp", version: SERVER_VERSION });
+
+  server.registerTool(
+    "diagnose",
+    {
+      title: "Diagnose the OpenSCAD environment",
+      description:
+        "Report whether the server can locate the OpenSCAD binary (and xvfb-run on headless Linux), " +
+        "including versions and the exact paths searched. Call this FIRST if check/render/export fail " +
+        "with a 'not found' or 'cannot run' error — it shows whether the problem is a missing install " +
+        "or a PATH issue, and what to set OPENSCAD_PATH to.",
+      inputSchema: {},
+    },
+    async () => {
+      const probe = await probeEnvironment();
+      const status = probe.ok ? "READY" : "NOT READY";
+      return {
+        content: [{ type: "text", text: `OpenSCAD MCP environment: ${status}\n${probe.report}` } satisfies TextBlock],
+      };
+    },
+  );
 
   server.registerTool(
     "check_model",

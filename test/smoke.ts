@@ -44,10 +44,18 @@ async function main() {
   const tools = await client.listTools();
   const names = tools.tools.map((t) => t.name).sort();
   assert(
-    JSON.stringify(names) === JSON.stringify(["check_model", "export_model", "render_model"]),
+    JSON.stringify(names) ===
+      JSON.stringify(["check_model", "diagnose", "export_model", "render_model"]),
     `unexpected tool list: ${names.join(", ")}`,
   );
   console.log("PASS tool discovery:", names.join(", "));
+
+  // 0. diagnose reports a ready environment here
+  const diag: any = await client.callTool({ name: "diagnose", arguments: {} });
+  assert(!diag.isError, `diagnose should not error, got: ${textOf(diag)}`);
+  assert(/READY/.test(textOf(diag)), `diagnose should report READY, got: ${textOf(diag)}`);
+  assert(/OpenSCAD: \//.test(textOf(diag)), "diagnose should report the resolved binary path");
+  console.log("PASS diagnose:", textOf(diag).split("\n").slice(0, 2).join(" | "));
 
   // 1. check_model flags broken code
   const bad: any = await client.callTool({ name: "check_model", arguments: { code: BROKEN } });
