@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
@@ -26,9 +26,23 @@ const COLOR_SCHEMES = [
 const EXPORT_FORMATS = ["stl", "off", "amf", "3mf", "csg"] as const;
 
 const codeSchema = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .describe(
+    "Complete OpenSCAD source (the whole program, not a fragment). Accepts a single string OR an " +
+      "array of lines (joined with newlines). Prefer the array form for long programs — it avoids " +
+      "the JSON-escaping and truncation problems of one giant single-line string. " +
+      "Provide either `code` or `code_path`.",
+  );
+
+const codePathSchema = z
   .string()
-  .min(1)
-  .describe("Complete OpenSCAD source code (the full program, not a fragment).");
+  .optional()
+  .describe(
+    "Absolute path to a .scad file to render instead of inlining source. Best for large models: " +
+      "write the file with your editor/file tool, then pass its path here. The file must be readable " +
+      "by the server process. Provide either `code` or `code_path`.",
+  );
 
 const parametersSchema = z
   .record(z.union([z.string(), z.number(), z.boolean()]))
@@ -49,6 +63,32 @@ function describeFailure(stderr: string): string {
   return diag.length > 0 ? diag.join("\n") : stderr.trim().slice(-2000) || "unknown error";
 }
 
+/**
+ * Resolve the OpenSCAD source for a call. Source may arrive inline as a string,
+ * as an array of lines (joined with newlines — friendlier to JSON encoding for
+ * long programs), or as a path to a .scad file the caller already wrote.
+ */
+async function resolveSource(
+  code: string | string[] | undefined,
+  codePath: string | undefined,
+): Promise<{ code: string } | { error: string }> {
+  if (codePath) {
+    try {
+      return { code: await readFile(codePath, "utf8") };
+    } catch (err) {
+      return { error: `Could not read code_path '${codePath}': ${(err as Error).message}` };
+    }
+  }
+  if (code !== undefined) {
+    const text = Array.isArray(code) ? code.join("\n") : code;
+    if (text.trim().length === 0) return { error: "`code` is empty." };
+    return { code: text };
+  }
+  return {
+    error: "Provide either `code` (OpenSCAD source) or `code_path` (path to a .scad file).",
+  };
+}
+
 export function createServer(): McpServer {
   const server = new McpServer({ name: "openscad-mcp", version: SERVER_VERSION });
 
@@ -62,11 +102,14 @@ export function createServer(): McpServer {
         "Follow up with render_model to see the result.",
       inputSchema: {
         code: codeSchema,
+        code_path: codePathSchema,
         parameters: parametersSchema,
       },
     },
-    async ({ code, parameters }) => {
-      const result = await runOpenscad(code, "csg", defineArgs(parameters));
+    async ({ code, code_path, parameters }) => {
+      const src = await resolveSource(code, code_path);
+      if ("error" in src) return errorResult(src.error);
+      const result = await runOpenscad(src.code, "csg", defineArgs(parameters));
       if (result.exitCode !== 0) {
         return errorResult(`OpenSCAD reported errors:\n${describeFailure(result.stderr)}`);
       }
@@ -90,6 +133,7 @@ export function createServer(): McpServer {
         "(useful when difference()/intersection() previews look wrong).",
       inputSchema: {
         code: codeSchema,
+        code_path: codePathSchema,
         views: z
           .preprocess(
             (v) => (typeof v === "string" ? [v] : v),
@@ -115,7 +159,10 @@ export function createServer(): McpServer {
         parameters: parametersSchema,
       },
     },
-    async ({ code, views, width, height, color_scheme, full_render, parameters }) => {
+    async ({ code, code_path, views, width, height, color_scheme, full_render, parameters }) => {
+      const src = await resolveSource(code, code_path);
+      if ("error" in src) return errorResult(src.error);
+
       // Be forgiving: dedupe views, cap at 7, fall back on an unknown color scheme.
       const viewList = [...new Set(views as ViewName[])].slice(0, 7);
       const scheme = (COLOR_SCHEMES as readonly string[]).includes(color_scheme ?? "")
@@ -139,7 +186,7 @@ export function createServer(): McpServer {
           ...(full_render ? ["--render"] : []),
           ...defineArgs(parameters),
         ];
-        const result = await runOpenscad(code, "png", args);
+        const result = await runOpenscad(src.code, "png", args);
         if (result.exitCode !== 0 || !result.output) {
           return errorResult(
             `Render failed (view: ${view}):\n${describeFailure(result.stderr)}`,
@@ -174,6 +221,7 @@ export function createServer(): McpServer {
         "Runs a full geometry render. Call this once the previews look right.",
       inputSchema: {
         code: codeSchema,
+        code_path: codePathSchema,
         format: z
           .string()
           .optional()
@@ -185,13 +233,16 @@ export function createServer(): McpServer {
         parameters: parametersSchema,
       },
     },
-    async ({ code, format, filename, parameters }) => {
+    async ({ code, code_path, format, filename, parameters }) => {
+      const src = await resolveSource(code, code_path);
+      if ("error" in src) return errorResult(src.error);
+
       const fmt = (format ?? "stl").toLowerCase().replace(/^\./, "");
       if (!(EXPORT_FORMATS as readonly string[]).includes(fmt)) {
         return errorResult(`Unknown format '${format}'. Valid: ${EXPORT_FORMATS.join(", ")}.`);
       }
 
-      const result = await runOpenscad(code, fmt, defineArgs(parameters));
+      const result = await runOpenscad(src.code, fmt, defineArgs(parameters));
       if (result.exitCode !== 0 || !result.output) {
         return errorResult(`Export failed:\n${describeFailure(result.stderr)}`);
       }

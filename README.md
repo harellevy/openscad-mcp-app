@@ -15,6 +15,20 @@ conversation, and refines it — then exports an STL when the model is right.
 All tools accept `parameters` — a map applied as OpenSCAD `-D name=value` overrides, so individual
 values can be tweaked without resending changed source.
 
+### Passing source code
+
+Every tool takes the model source one of three ways. For anything beyond a few lines, prefer the
+last two — a long program crammed into a single JSON string is the most common cause of failed tool
+calls (the model mis-escapes a newline/quote or the arguments get truncated, and the MCP client
+rejects the call before the server sees it):
+
+- `code: "<full program>"` — a single string. Fine for short snippets.
+- `code: ["line 1", "line 2", …]` — an array of lines, joined with newlines. Each line is escaped
+  independently, so this sidesteps the giant-single-string fragility.
+- `code_path: "/abs/path/to/model.scad"` — render a file on disk. **Best for large models in Claude
+  Code:** have the assistant write the `.scad` file with its normal editor tool, then pass the path.
+  No source travels through the tool-call JSON at all.
+
 ## Requirements
 
 - Node.js ≥ 18

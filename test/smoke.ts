@@ -98,6 +98,38 @@ async function main() {
   );
   console.log("PASS render_model tolerant of loose inputs (string view/dims, bad scheme)");
 
+  // 4d. code as an array of lines (joined with newlines) — the JSON-safe form
+  // for long programs. Includes a quoted string literal like part = "assembly".
+  const arrayCode: any = await client.callTool({
+    name: "render_model",
+    arguments: {
+      code: [
+        '// array-form source with a quoted literal',
+        'part = "assembly";',
+        "size = 15;",
+        "cube(size, center = true);",
+      ],
+      width: 320,
+      height: 240,
+    },
+  });
+  assert(!arrayCode.isError, `array-form code should render, got: ${textOf(arrayCode)}`);
+  console.log("PASS render_model accepts array-of-lines code (quotes intact)");
+
+  // 4e. code_path — render a .scad file on disk instead of inlining source.
+  const pathRender: any = await client.callTool({
+    name: "render_model",
+    arguments: { code_path: path.resolve("examples/enclosure.scad"), width: 320, height: 240 },
+  });
+  assert(!pathRender.isError, `code_path should render, got: ${textOf(pathRender)}`);
+  console.log("PASS render_model via code_path");
+
+  // 4f. neither code nor code_path -> clear, non-fatal error result
+  const missing: any = await client.callTool({ name: "render_model", arguments: {} });
+  assert(missing.isError === true, "missing source should set isError");
+  assert(/code_path/.test(textOf(missing)), "error should mention code_path");
+  console.log("PASS render_model reports missing source clearly");
+
   // 5. export_model writes an STL
   const exp: any = await client.callTool({
     name: "export_model",
