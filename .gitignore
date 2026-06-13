@@ -3,3 +3,6 @@ dist/
 exports/
 *.log
 .DS_Store
+
+# Local-only skills — never shared via git
+.claude/skills/
