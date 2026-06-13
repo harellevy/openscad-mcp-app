@@ -5,7 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "openscad-mcp": "dist/index.js"
+    "openscad-mcp": "dist/index.js",
+    "openscad-mcp-doctor": "dist/doctor.js"
   },
   "files": [
     "dist"
@@ -14,6 +15,7 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "doctor": "node dist/doctor.js",
     "test": "npm run build && tsx test/smoke.ts"
   },
   "engines": {
