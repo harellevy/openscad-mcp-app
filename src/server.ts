@@ -4,6 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
 import { defineArgs, diagnostics, probeEnvironment, runOpenscad } from "./openscad.js";
+import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
 const SERVER_VERSION = "0.1.0";
 
@@ -285,6 +286,107 @@ export function createServer(): McpServer {
       ].join("\n");
 
       return { content: [{ type: "text", text } satisfies TextBlock] };
+    },
+  );
+
+  // Interactive 3D viewer (MCP Apps / SEP-1865). The HTML resource is static;
+  // view_model ships the mesh in its result _meta, which the host forwards to
+  // the iframe via a ui/notifications/tool-result postMessage.
+  server.registerResource(
+    "model-viewer",
+    VIEWER_URI,
+    {
+      title: "OpenSCAD 3D viewer",
+      description: "Interactive 3D model viewer (rotate/zoom) with STL/PNG download buttons.",
+      mimeType: VIEWER_MIME,
+      // prefersBorder:true keeps claude.ai from wrapping the iframe in an opaque
+      // white card (counter-intuitive vs the spec wording, but empirically correct).
+      _meta: { ui: { prefersBorder: true } },
+    },
+    async (uri) => ({
+      contents: [{ uri: uri.href, mimeType: VIEWER_MIME, text: buildViewerHtml() }],
+    }),
+  );
+
+  server.registerTool(
+    "view_model",
+    {
+      title: "View model in interactive 3D",
+      description:
+        "Render the model AND open it in an interactive 3D viewer panel in the chat — rotate, zoom, and " +
+        "download the STL/PNG. Use this when the user wants to SEE and inspect the result, not just a static " +
+        "image. Returns a PNG too, so hosts that can't render the panel still show the preview.",
+      inputSchema: {
+        code: codeSchema,
+        code_path: codePathSchema,
+        view: z
+          .enum(VIEW_NAMES)
+          .default("diagonal")
+          .describe("Camera preset for the PNG thumbnail/fallback. The 3D panel is freely orbitable."),
+        width: z.coerce.number().int().min(64).max(1920).default(900).describe("Preview width in pixels."),
+        height: z.coerce.number().int().min(64).max(1920).default(700).describe("Preview height in pixels."),
+        color_scheme: z
+          .string()
+          .optional()
+          .describe(`Color scheme for the PNG (unknown falls back to Cornfield). Valid: ${COLOR_SCHEMES.join(", ")}.`),
+        name: z.string().optional().describe("Display name / download filename stem for the model."),
+        parameters: parametersSchema,
+      },
+      _meta: { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } },
+    },
+    async ({ code, code_path, view, width, height, color_scheme, name, parameters }) => {
+      const src = await resolveSource(code, code_path);
+      if ("error" in src) return errorResult(src.error);
+      const scheme = (COLOR_SCHEMES as readonly string[]).includes(color_scheme ?? "")
+        ? (color_scheme as string)
+        : "Cornfield";
+
+      const png = await runOpenscad(src.code, "png", [
+        "--imgsize",
+        `${width},${height}`,
+        "--camera",
+        VIEWS[view as ViewName],
+        "--autocenter",
+        "--viewall",
+        "--colorscheme",
+        scheme,
+        ...defineArgs(parameters),
+      ]);
+      if (png.exitCode !== 0 || !png.output) {
+        return errorResult(`Render failed:\n${describeFailure(png.stderr)}`);
+      }
+
+      const stl = await runOpenscad(src.code, "stl", defineArgs(parameters));
+      if (stl.exitCode !== 0 || !stl.output) {
+        return errorResult(`Mesh export failed:\n${describeFailure(stl.stderr)}`);
+      }
+
+      const stem = (name ? name : "model").replace(/[^\w.-]+/g, "_") || "model";
+      const stats = `STL ${formatBytes(stl.output.length)}, rendered in ${png.durationMs + stl.durationMs} ms`;
+      const warnings = diagnostics(png.stderr).concat(diagnostics(stl.stderr));
+
+      // structuredContent is the channel the host pushes to the iframe (it is not
+      // shown to the model); _meta.ui links the tool to its UI resource.
+      return {
+        content: [
+          { type: "image", data: png.output.toString("base64"), mimeType: "image/png" },
+          {
+            type: "text",
+            text:
+              `Interactive 3D viewer ready for "${stem}" (rotate/zoom + download in the panel). ${stats}.` +
+              (warnings.length > 0 ? `\nDiagnostics:\n${warnings.join("\n")}` : ""),
+          },
+        ],
+        structuredContent: {
+          kind: "3d",
+          state: "completed",
+          name: stem,
+          stats: stats,
+          stlBase64: stl.output.toString("base64"),
+          pngBase64: png.output.toString("base64"),
+        },
+        _meta: { ui: { resourceUri: VIEWER_URI, visibility: ["model", "app"] } },
+      };
     },
   );
 

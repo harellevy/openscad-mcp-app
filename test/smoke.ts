@@ -45,10 +45,43 @@ async function main() {
   const names = tools.tools.map((t) => t.name).sort();
   assert(
     JSON.stringify(names) ===
-      JSON.stringify(["check_model", "diagnose", "export_model", "render_model"]),
+      JSON.stringify(["check_model", "diagnose", "export_model", "render_model", "view_model"]),
     `unexpected tool list: ${names.join(", ")}`,
   );
   console.log("PASS tool discovery:", names.join(", "));
+
+  // MCP Apps wiring (SEP-1865): the UI resource, the tool->resource link, and
+  // the mesh payload the host forwards to the iframe.
+  const VIEWER_URI = "ui://openscad/viewer";
+  const VIEWER_MIME = "text/html;profile=mcp-app";
+
+  const resources: any = await client.listResources();
+  const viewer = (resources.resources as any[]).find((r) => r.uri === VIEWER_URI);
+  assert(viewer, `resource ${VIEWER_URI} not listed`);
+  assert(viewer.mimeType === VIEWER_MIME, `viewer mimeType is ${viewer.mimeType}, expected ${VIEWER_MIME}`);
+  const read: any = await client.readResource({ uri: VIEWER_URI });
+  const html = read.contents[0].text as string;
+  assert(/webgl/i.test(html) && /tool-result/.test(html), "viewer HTML missing WebGL renderer / handshake markers");
+  assert(!/https?:\/\//.test(html.replace(/ui\/\/[^"'\s]*/g, "")), "viewer HTML must not load any external (http) resources");
+  console.log("PASS MCP Apps resource:", VIEWER_URI, `(${VIEWER_MIME}, ${html.length} bytes)`);
+
+  const viewTool = tools.tools.find((t) => t.name === "view_model");
+  assert((viewTool as any)?._meta?.ui?.resourceUri === VIEWER_URI, "view_model is not linked to the UI resource via _meta.ui.resourceUri");
+  console.log("PASS view_model linked to UI resource via _meta.ui.resourceUri");
+
+  const viewed: any = await client.callTool({
+    name: "view_model",
+    arguments: { code: DEMO, name: "smoke-cube", width: 400, height: 300 },
+  });
+  assert(!viewed.isError, `view_model should succeed, got: ${textOf(viewed)}`);
+  assert((viewed.content as any[]).some((c) => c.type === "image"), "view_model should include a PNG fallback image");
+  const payload = viewed.structuredContent;
+  assert(payload?.stlBase64 && payload?.pngBase64, "view_model structuredContent missing stl/png payload");
+  assert((viewed as any)._meta?.ui?.resourceUri === VIEWER_URI, "view_model result _meta.ui.resourceUri missing");
+  const stlBytes = Buffer.from(payload.stlBase64, "base64");
+  assert(stlBytes.length > 84, "decoded STL too small to be valid");
+  assert(Buffer.from(payload.pngBase64, "base64").subarray(1, 4).toString() === "PNG", "png payload is not a PNG");
+  console.log("PASS view_model 3D payload:", `${stlBytes.length}-byte STL + PNG in _meta`);
 
   // 0. diagnose reports a ready environment here
   const diag: any = await client.callTool({ name: "diagnose", arguments: {} });

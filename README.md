@@ -8,9 +8,13 @@ conversation, and refines it — then exports an STL when the model is right.
 
 | Tool | What it does |
 |---|---|
-| `check_model` | Fast parse/eval validation — errors & warnings with line numbers, no geometry render |
+| `view_model` | **Interactive 3D viewer inline in chat** (MCP Apps / SEP-1865): rotate/zoom + STL/PNG download buttons. Returns a PNG too, so hosts without MCP-Apps support still show a preview. Best in Claude Desktop / claude.ai. |
 | `render_model` | PNG preview(s) returned inline. Options: `views` (diagonal/front/back/left/right/top/bottom), `width`/`height`, `color_scheme`, `full_render` (CGAL), `parameters` (`-D` overrides) |
+| `check_model` | Fast parse/eval validation — errors & warnings with line numbers, no geometry render |
 | `export_model` | Export `stl` / `off` / `amf` / `3mf` / `csg` to the exports directory |
+| `diagnose` | Report whether the server can find/run OpenSCAD (path, version, what was probed). Call first if other tools fail. |
+
+The interactive viewer is **fully self-contained** — a hand-written WebGL STL renderer, no three.js, no CDN, no external loads (the MCP-Apps iframe CSP blocks external `<script src>`). It parses both ASCII and binary STL and falls back to the PNG if WebGL is unavailable.
 
 All tools accept `parameters` — a map applied as OpenSCAD `-D name=value` overrides, so individual
 values can be tweaked without resending changed source.
