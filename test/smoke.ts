@@ -84,7 +84,7 @@ async function main() {
     arguments: { code: DEMO, name: "smoke-cube", width: 400, height: 300 },
   });
   assert(!viewed.isError, `view_model should succeed, got: ${textOf(viewed)}`);
-  assert((viewed.content as any[]).some((c) => c.type === "image"), "view_model should include a PNG fallback image");
+  assert(!(viewed.content as any[]).some((c) => c.type === "image"), "view_model must NOT return an image block when the mesh is present (it preempts the MCP-App widget)");
   const payload = viewed.structuredContent;
   assert((payload?.stlBase64 || payload?.stlGzipBase64) && payload?.pngBase64, "view_model structuredContent missing mesh/png payload");
   assert((viewed as any)._meta?.ui?.resourceUri === VIEWER_URI, "view_model result _meta.ui.resourceUri missing");
@@ -132,25 +132,23 @@ async function main() {
   assert(!ok.isError, `valid code should pass, got: ${textOf(ok)}`);
   console.log("PASS check_model (valid):", textOf(ok).split("\n")[0]);
 
-  // 3. render_model returns inline images for multiple views
+  // 3. render_model mounts the inline viewer (no competing image content blocks)
   const render: any = await client.callTool({
     name: "render_model",
     arguments: { code: DEMO, views: ["diagonal", "top"], width: 640, height: 480 },
   });
   assert(!render.isError, `render should succeed, got: ${textOf(render)}`);
-  const images = (render.content as any[]).filter((c) => c.type === "image");
-  assert(images.length === 2, `expected 2 images, got ${images.length}`);
-  await mkdir(RENDER_DIR, { recursive: true });
-  for (const [i, img] of images.entries()) {
-    assert(img.mimeType === "image/png", "image should be a PNG");
-    const buf = Buffer.from(img.data, "base64");
-    assert(buf.subarray(1, 4).toString() === "PNG", "image data should decode to a PNG");
-    await writeFile(path.join(RENDER_DIR, `view-${i}.png`), buf);
-  }
-  assert(Buffer.from(render.structuredContent?.stlBase64 ?? "", "base64").length > 84, "render_model should also return STL bytes for the inline viewer");
+  // With the viewer attached there must be NO top-level image blocks — they'd
+  // make the host show a static asset and preempt the MCP-App widget.
+  assert(!(render.content as any[]).some((c) => c.type === "image"), "render_model must not return image blocks when the viewer is attached");
   assert((render as any)._meta?.ui?.resourceUri === VIEWER_URI, "render_model should mount the inline viewer via _meta.ui.resourceUri");
+  const rsc = render.structuredContent;
+  assert(Buffer.from(rsc?.stlBase64 ?? "", "base64").length > 84, "render_model should carry binary STL in structuredContent");
+  assert(Buffer.from(rsc?.pngBase64 ?? "", "base64").subarray(1, 4).toString() === "PNG", "render_model should carry the PNG fallback in structuredContent");
   assert(Buffer.byteLength(JSON.stringify(render)) < 1_000_000, "render_model result must stay under the 1MB host limit");
-  console.log("PASS render_model (inline viewer + PNG fallback):", textOf(render).split("\n")[0], `(PNGs in ${RENDER_DIR})`);
+  await mkdir(RENDER_DIR, { recursive: true });
+  await writeFile(path.join(RENDER_DIR, "render-fallback.png"), Buffer.from(rsc.pngBase64, "base64"));
+  console.log("PASS render_model (widget, no competing image):", textOf(render).split("\n")[0]);
 
   // 4. render_model honors -D parameter overrides
   const paramRender: any = await client.callTool({
@@ -167,10 +165,7 @@ async function main() {
     arguments: { code: DEMO, views: "front", width: "320", height: "240", color_scheme: "nope" },
   });
   assert(!loose.isError, `loose inputs should be tolerated, got: ${textOf(loose)}`);
-  assert(
-    (loose.content as any[]).filter((c) => c.type === "image").length === 1,
-    "expected 1 image from single-string view",
-  );
+  assert((loose as any)._meta?.ui?.resourceUri === VIEWER_URI, "loose inputs should still render and mount the viewer");
   console.log("PASS render_model tolerant of loose inputs (string view/dims, bad scheme)");
 
   // 4d. code as an array of lines (joined with newlines) — the JSON-safe form

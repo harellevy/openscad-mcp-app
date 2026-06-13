@@ -8,7 +8,7 @@ import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
 import { defineArgs, diagnostics, probeEnvironment, runOpenscad, toBinaryStl } from "./openscad.js";
 import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
-const SERVER_VERSION = "0.2.2";
+const SERVER_VERSION = "0.2.3";
 
 // Default to a guaranteed-writable dir. The server's cwd when spawned by a host
 // (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
@@ -321,8 +321,14 @@ export function createServer(): McpServer {
       ].join("\n");
       content.push({ type: "text", text: summary });
 
+      // Drop the preview PNG blocks when the interactive viewer is attached so
+      // the host mounts the widget instead of rendering the image as a direct
+      // asset. The first PNG still rides in structuredContent for the widget's
+      // own fallback. Keep the images only when there's no interactive mesh.
+      const dropImages = !!viewerMeta && !meshOmitted;
+      const finalContent = dropImages ? content.filter((c) => c.type !== "image") : content;
       return clampResult({
-        content,
+        content: finalContent,
         ...(structuredContent ? { structuredContent } : {}),
         ...(viewerMeta ? { _meta: viewerMeta } : {}),
       });
@@ -514,16 +520,22 @@ export function createServer(): McpServer {
 
       // structuredContent is the channel the host pushes to the iframe (it is not
       // shown to the model); _meta.ui links the tool to its UI resource.
-      const content: Array<TextBlock | ImageBlock> = [
-        { type: "image", data: png.output.toString("base64"), mimeType: "image/png" },
-        {
-          type: "text",
-          text:
-            `Interactive 3D viewer ready for "${stem}" (rotate/zoom + download in the panel). ${stats}.` +
-            (mesh.meshOmitted ? " (Model too large for inline 3D — showing the image instead.)" : "") +
-            (warnings.length > 0 ? `\nDiagnostics:\n${warnings.join("\n")}` : ""),
-        },
-      ];
+      // No top-level image block when the interactive viewer is attached — a
+      // renderable image content block makes the host show the PNG as a "direct
+      // asset" and preempts mounting the MCP-App widget. The PNG still rides in
+      // structuredContent.pngBase64 for the widget's own fallback. Only surface
+      // a top-level image when there's no interactive mesh to show.
+      const content: Array<TextBlock | ImageBlock> = [];
+      if (mesh.meshOmitted) {
+        content.push({ type: "image", data: png.output.toString("base64"), mimeType: "image/png" });
+      }
+      content.push({
+        type: "text",
+        text:
+          `Interactive 3D viewer ready for "${stem}" (rotate/zoom + download in the panel). ${stats}.` +
+          (mesh.meshOmitted ? " (Model too large for inline 3D — showing the image instead.)" : "") +
+          (warnings.length > 0 ? `\nDiagnostics:\n${warnings.join("\n")}` : ""),
+      });
       return clampResult({
         content,
         structuredContent: {
