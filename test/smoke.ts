@@ -1,0 +1,240 @@
+/**
+ * End-to-end smoke test: spawns the built server over stdio with a real MCP
+ * client and exercises all three tools against the real OpenSCAD binary.
+ * Run with: npm test
+ */
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+const DEMO = `// demo bracket
+size = 20;
+difference() {
+  cube([size, size, 8], center = true);
+  cylinder(d = 8, h = 20, center = true, $fn = 48);
+}
+`;
+
+const BROKEN = "cube([10, 10, 10);"; // unbalanced bracket -> parse error
+
+const RENDER_DIR = "/tmp/smoke-renders";
+
+function assert(cond: unknown, message: string): asserts cond {
+  if (!cond) throw new Error(`ASSERTION FAILED: ${message}`);
+}
+
+function textOf(result: any): string {
+  return (result.content as any[])
+    .filter((c) => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+}
+
+async function main() {
+  const transport = new StdioClientTransport({
+    command: "node",
+    args: ["dist/index.js"],
+    env: { ...process.env, OPENSCAD_MCP_EXPORT_DIR: "/tmp/smoke-exports" },
+  });
+  const client = new Client({ name: "smoke-test", version: "0.0.0" });
+  await client.connect(transport);
+
+  // A second server instance whose export dir can never be created (its parent
+  // is a file → ENOTDIR even as root), to prove export survives an unwritable dir.
+  const roTransport = new StdioClientTransport({
+    command: "node",
+    args: ["dist/index.js"],
+    env: { ...process.env, OPENSCAD_MCP_EXPORT_DIR: "/etc/hostname/exports" },
+  });
+  const roClient = new Client({ name: "smoke-test-ro", version: "0.0.0" });
+  await roClient.connect(roTransport);
+
+  // Tool discovery
+  const tools = await client.listTools();
+  const names = tools.tools.map((t) => t.name).sort();
+  assert(
+    JSON.stringify(names) ===
+      JSON.stringify(["check_model", "diagnose", "export_model", "render_model", "view_model"]),
+    `unexpected tool list: ${names.join(", ")}`,
+  );
+  console.log("PASS tool discovery:", names.join(", "));
+
+  // MCP Apps wiring (SEP-1865): the UI resource, the tool->resource link, and
+  // the mesh payload the host forwards to the iframe.
+  const VIEWER_URI = "ui://openscad/viewer";
+  const VIEWER_MIME = "text/html;profile=mcp-app";
+
+  const resources: any = await client.listResources();
+  const viewer = (resources.resources as any[]).find((r) => r.uri === VIEWER_URI);
+  assert(viewer, `resource ${VIEWER_URI} not listed`);
+  assert(viewer.mimeType === VIEWER_MIME, `viewer mimeType is ${viewer.mimeType}, expected ${VIEWER_MIME}`);
+  const read: any = await client.readResource({ uri: VIEWER_URI });
+  const html = read.contents[0].text as string;
+  assert(/webgl/i.test(html) && /tool-result/.test(html), "viewer HTML missing WebGL renderer / handshake markers");
+  assert(!/https?:\/\//.test(html.replace(/ui\/\/[^"'\s]*/g, "")), "viewer HTML must not load any external (http) resources");
+  console.log("PASS MCP Apps resource:", VIEWER_URI, `(${VIEWER_MIME}, ${html.length} bytes)`);
+
+  const viewTool = tools.tools.find((t) => t.name === "view_model");
+  assert((viewTool as any)?._meta?.ui?.resourceUri === VIEWER_URI, "view_model is not linked to the UI resource via _meta.ui.resourceUri");
+  console.log("PASS view_model linked to UI resource via _meta.ui.resourceUri");
+
+  const viewed: any = await client.callTool({
+    name: "view_model",
+    arguments: { code: DEMO, name: "smoke-cube", width: 400, height: 300 },
+  });
+  assert(!viewed.isError, `view_model should succeed, got: ${textOf(viewed)}`);
+  assert(!(viewed.content as any[]).some((c) => c.type === "image"), "view_model must NOT return an image block when the mesh is present (it preempts the MCP-App widget)");
+  const payload = viewed.structuredContent;
+  assert((payload?.stlBase64 || payload?.stlGzipBase64) && payload?.pngBase64, "view_model structuredContent missing mesh/png payload");
+  assert((viewed as any)._meta?.ui?.resourceUri === VIEWER_URI, "view_model result _meta.ui.resourceUri missing");
+  // The mesh must be compact BINARY STL (not the ~5x-larger ASCII OpenSCAD emits).
+  const stlBytes = Buffer.from(payload.stlBase64, "base64");
+  assert(stlBytes.length > 84 && 84 + stlBytes.readUInt32LE(80) * 50 === stlBytes.length, "mesh payload is not valid binary STL");
+  assert(Buffer.from(payload.pngBase64, "base64").subarray(1, 4).toString() === "PNG", "png payload is not a PNG");
+  assert(Buffer.byteLength(JSON.stringify(viewed)) < 1_000_000, "view_model result must stay under the 1MB host limit");
+  console.log("PASS view_model 3D payload:", `${stlBytes.length}-byte binary STL, result ${(Buffer.byteLength(JSON.stringify(viewed)) / 1024 | 0)}KB`);
+
+  // A real, non-trivial model must stay under the 1MB host cap (binary + gzip +
+  // clamp path) — this is the "Tool result is too large" regression guard.
+  const big: any = await client.callTool({
+    name: "view_model",
+    arguments: { code_path: path.resolve("examples/wire_straightener.scad"), name: "wire", width: 400, height: 300 },
+  });
+  assert(!big.isError, `view_model on a large model must not error, got: ${textOf(big)}`);
+  const bigSize = Buffer.byteLength(JSON.stringify(big));
+  assert(bigSize < 1_000_000, `large-model result must stay under 1MB, was ${bigSize} bytes`);
+  const bsc = big.structuredContent;
+  assert(bsc?.stlBase64 || bsc?.stlGzipBase64 || bsc?.meshOmitted, "large model should carry a mesh or be flagged meshOmitted");
+  console.log(
+    "PASS view_model large model under 1MB:",
+    `${(bigSize / 1024) | 0}KB`,
+    bsc?.stlBase64 ? "(binary)" : bsc?.stlGzipBase64 ? "(gzip)" : "(mesh omitted)",
+  );
+
+  // 0. diagnose reports a ready environment here
+  const diag: any = await client.callTool({ name: "diagnose", arguments: {} });
+  assert(!diag.isError, `diagnose should not error, got: ${textOf(diag)}`);
+  assert(/READY/.test(textOf(diag)), `diagnose should report READY, got: ${textOf(diag)}`);
+  assert(/OpenSCAD: \//.test(textOf(diag)), "diagnose should report the resolved binary path");
+  assert(/openscad-mcp v\d/.test(textOf(diag)), "diagnose should report the server version (build verification)");
+  assert(/Export dir:/.test(textOf(diag)), "diagnose should report the active export dir (proves it's not /exports)");
+  console.log("PASS diagnose:", textOf(diag).split("\n").slice(0, 2).join(" | "));
+
+  // 1. check_model flags broken code
+  const bad: any = await client.callTool({ name: "check_model", arguments: { code: BROKEN } });
+  assert(bad.isError === true, "broken code should set isError");
+  assert(/ERROR/i.test(textOf(bad)), "error text should contain ERROR");
+  console.log("PASS check_model (broken):", textOf(bad).split("\n")[1] ?? textOf(bad));
+
+  // 2. check_model passes valid code
+  const ok: any = await client.callTool({ name: "check_model", arguments: { code: DEMO } });
+  assert(!ok.isError, `valid code should pass, got: ${textOf(ok)}`);
+  console.log("PASS check_model (valid):", textOf(ok).split("\n")[0]);
+
+  // 3. render_model mounts the inline viewer (no competing image content blocks)
+  const render: any = await client.callTool({
+    name: "render_model",
+    arguments: { code: DEMO, views: ["diagonal", "top"], width: 640, height: 480 },
+  });
+  assert(!render.isError, `render should succeed, got: ${textOf(render)}`);
+  // With the viewer attached there must be NO top-level image blocks — they'd
+  // make the host show a static asset and preempt the MCP-App widget.
+  assert(!(render.content as any[]).some((c) => c.type === "image"), "render_model must not return image blocks when the viewer is attached");
+  assert((render as any)._meta?.ui?.resourceUri === VIEWER_URI, "render_model should mount the inline viewer via _meta.ui.resourceUri");
+  const rsc = render.structuredContent;
+  assert(Buffer.from(rsc?.stlBase64 ?? "", "base64").length > 84, "render_model should carry binary STL in structuredContent");
+  assert(Buffer.from(rsc?.pngBase64 ?? "", "base64").subarray(1, 4).toString() === "PNG", "render_model should carry the PNG fallback in structuredContent");
+  assert(Buffer.byteLength(JSON.stringify(render)) < 1_000_000, "render_model result must stay under the 1MB host limit");
+  await mkdir(RENDER_DIR, { recursive: true });
+  await writeFile(path.join(RENDER_DIR, "render-fallback.png"), Buffer.from(rsc.pngBase64, "base64"));
+  console.log("PASS render_model (widget, no competing image):", textOf(render).split("\n")[0]);
+
+  // 4. render_model honors -D parameter overrides
+  const paramRender: any = await client.callTool({
+    name: "render_model",
+    arguments: { code: DEMO, parameters: { size: 40 }, width: 320, height: 240 },
+  });
+  assert(!paramRender.isError, `param render should succeed, got: ${textOf(paramRender)}`);
+  console.log("PASS render_model with -D parameters");
+
+  // 4c. render_model tolerates loose inputs: bare-string view, string-encoded
+  // numbers, and an unknown color scheme (should fall back, not error).
+  const loose: any = await client.callTool({
+    name: "render_model",
+    arguments: { code: DEMO, views: "front", width: "320", height: "240", color_scheme: "nope" },
+  });
+  assert(!loose.isError, `loose inputs should be tolerated, got: ${textOf(loose)}`);
+  assert((loose as any)._meta?.ui?.resourceUri === VIEWER_URI, "loose inputs should still render and mount the viewer");
+  console.log("PASS render_model tolerant of loose inputs (string view/dims, bad scheme)");
+
+  // 4d. code as an array of lines (joined with newlines) — the JSON-safe form
+  // for long programs. Includes a quoted string literal like part = "assembly".
+  const arrayCode: any = await client.callTool({
+    name: "render_model",
+    arguments: {
+      code: [
+        '// array-form source with a quoted literal',
+        'part = "assembly";',
+        "size = 15;",
+        "cube(size, center = true);",
+      ],
+      width: 320,
+      height: 240,
+    },
+  });
+  assert(!arrayCode.isError, `array-form code should render, got: ${textOf(arrayCode)}`);
+  console.log("PASS render_model accepts array-of-lines code (quotes intact)");
+
+  // 4e. code_path — render a .scad file on disk instead of inlining source.
+  const pathRender: any = await client.callTool({
+    name: "render_model",
+    arguments: { code_path: path.resolve("examples/enclosure.scad"), width: 320, height: 240 },
+  });
+  assert(!pathRender.isError, `code_path should render, got: ${textOf(pathRender)}`);
+  console.log("PASS render_model via code_path");
+
+  // 4f. neither code nor code_path -> clear, non-fatal error result
+  const missing: any = await client.callTool({ name: "render_model", arguments: {} });
+  assert(missing.isError === true, "missing source should set isError");
+  assert(/code_path/.test(textOf(missing)), "error should mention code_path");
+  console.log("PASS render_model reports missing source clearly");
+
+  // 5. export_model writes an STL AND returns the bytes + viewer link
+  const exp: any = await client.callTool({
+    name: "export_model",
+    arguments: { code: DEMO, format: "stl", filename: "smoke-bracket" },
+  });
+  assert(!exp.isError, `export should succeed, got: ${textOf(exp)}`);
+  assert(/Exported STL/.test(textOf(exp)), "export summary missing");
+  assert(Buffer.from(exp.structuredContent?.stlBase64 ?? "", "base64").length > 84, "export must return STL bytes in structuredContent");
+  assert((exp as any)._meta?.ui?.resourceUri === VIEWER_URI, "STL export should link the inline viewer");
+  console.log("PASS export_model (bytes + viewer):", textOf(exp).split("\n")[0]);
+
+  // 5b. export_model survives a read-only export dir (bytes still returned)
+  const expRO: any = await roClient.callTool({
+    name: "export_model",
+    arguments: { code: DEMO, format: "stl", filename: "smoke-ro" },
+  });
+  assert(!expRO.isError, `export must not fail on an unwritable dir, got: ${textOf(expRO)}`);
+  assert(Buffer.from(expRO.structuredContent?.stlBase64 ?? "", "base64").length > 84, "bytes must be returned even when disk write fails");
+  assert(/Not written to disk/.test(textOf(expRO)), "should note the disk write failure");
+  console.log("PASS export_model resilient to read-only dir");
+
+  // 5c. export_model accepts case-insensitive format ("STL" -> stl)
+  const expUpper: any = await client.callTool({
+    name: "export_model",
+    arguments: { code: DEMO, format: "STL", filename: "smoke-upper" },
+  });
+  assert(!expUpper.isError, `uppercase format should work, got: ${textOf(expUpper)}`);
+  console.log("PASS export_model case-insensitive format");
+
+  await client.close();
+  await roClient.close();
+  console.log("\nALL SMOKE TESTS PASSED");
+}
+
+main().catch((err) => {
+  console.error("SMOKE TEST FAILED:", err);
+  process.exit(1);
+});
