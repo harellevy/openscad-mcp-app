@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,13 +9,30 @@ import { VIEWS, VIEW_NAMES, type ViewName } from "./cameras.js";
 import { defineArgs, diagnostics, probeEnvironment, runOpenscad, toBinaryStl } from "./openscad.js";
 import { VIEWER_MIME, VIEWER_URI, buildViewerHtml } from "./viewer.js";
 
-const SERVER_VERSION = "0.2.3";
+const SERVER_VERSION = "0.3.0";
 
 // Default to a guaranteed-writable dir. The server's cwd when spawned by a host
 // (e.g. Claude Desktop) is often "/", so cwd-relative "exports" becomes the
 // unwritable "/exports". Bytes are returned in the result regardless of disk.
-const EXPORT_DIR =
+export const EXPORT_DIR =
   process.env.OPENSCAD_MCP_EXPORT_DIR ?? path.join(tmpdir(), "openscad-mcp-exports");
+
+// Short-lived store of produced assets so the HTTP /repair and /save endpoints
+// can act on the exact bytes a tool returned (keyed by `modelId` in structuredContent).
+const assetStash = new Map<string, { name: string; stl?: Buffer; png?: Buffer }>();
+function stashAsset(name: string, stl?: Buffer, png?: Buffer): string {
+  const id = randomUUID();
+  assetStash.set(id, { name, stl, png });
+  while (assetStash.size > 24) {
+    const oldest = assetStash.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    assetStash.delete(oldest);
+  }
+  return id;
+}
+export function getAsset(id: string): { name: string; stl?: Buffer; png?: Buffer } | undefined {
+  return assetStash.get(id);
+}
 
 const COLOR_SCHEMES = [
   "Cornfield",
@@ -298,11 +316,13 @@ export function createServer(): McpServer {
         if (stl.exitCode === 0 && stl.output) {
           const mesh = meshPayload(stl.output);
           meshOmitted = !!mesh.meshOmitted;
+          const modelId = stashAsset("model", stl.output, firstPng ? Buffer.from(firstPng, "base64") : undefined);
           structuredContent = {
             kind: "3d",
             state: "completed",
             name: "model",
             stats: `STL ${formatBytes(stl.output.length)}`,
+            modelId,
             pngBase64: firstPng,
             ...mesh,
           };
@@ -416,6 +436,7 @@ export function createServer(): McpServer {
         // write failed AND they're small enough to inline safely.
         if (fmt === "stl") {
           Object.assign(structuredContent, meshPayload(result.output));
+          structuredContent.modelId = stashAsset(stem, result.output);
         } else if (!savedTo) {
           const b64 = result.output.toString("base64");
           if (b64.length <= 600_000) structuredContent.fileBase64 = b64;
@@ -453,7 +474,16 @@ export function createServer(): McpServer {
       mimeType: VIEWER_MIME,
       // prefersBorder:true keeps claude.ai from wrapping the iframe in an opaque
       // white card (counter-intuitive vs the spec wording, but empirically correct).
-      _meta: { ui: { prefersBorder: true } },
+      // connectDomains lets the sandboxed iframe fetch the local HTTP server for
+      // repair/save (set only in HTTP mode, where OPENSCAD_MCP_BASE_URL is defined).
+      _meta: {
+        ui: {
+          prefersBorder: true,
+          ...(process.env.OPENSCAD_MCP_BASE_URL
+            ? { csp: { connectDomains: [process.env.OPENSCAD_MCP_BASE_URL] } }
+            : {}),
+        },
+      },
     },
     async (uri) => ({
       contents: [{ uri: uri.href, mimeType: VIEWER_MIME, text: buildViewerHtml() }],
@@ -517,6 +547,7 @@ export function createServer(): McpServer {
       const stats = `STL ${formatBytes(stl.output.length)}, rendered in ${png.durationMs + stl.durationMs} ms`;
       const warnings = diagnostics(png.stderr).concat(diagnostics(stl.stderr));
       const mesh = meshPayload(stl.output);
+      const modelId = stashAsset(stem, stl.output, png.output);
 
       // structuredContent is the channel the host pushes to the iframe (it is not
       // shown to the model); _meta.ui links the tool to its UI resource.
@@ -543,6 +574,7 @@ export function createServer(): McpServer {
           state: "completed",
           name: stem,
           stats: stats,
+          modelId,
           pngBase64: png.output.toString("base64"),
           ...mesh,
         },

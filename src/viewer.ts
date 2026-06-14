@@ -48,6 +48,14 @@ export function buildViewerHtml(): string {
   button:hover { background: #3a3d44; }
   button:disabled { opacity: 0.4; cursor: default; }
   #status { position: absolute; top: 10px; left: 12px; right: 12px; color: #9aa0a6; }
+  #progress { position: absolute; left: 0; right: 0; bottom: 47px; padding: 7px 10px;
+    background: rgba(20,21,24,0.95); border-top: 1px solid #34363b; display: none; }
+  #progress.on { display: block; }
+  #track { height: 6px; background: #2f3136; border-radius: 3px; overflow: hidden; }
+  #pbar { height: 100%; width: 0%; background: linear-gradient(90deg, #6C5CE7, #38D4DD);
+    transition: width .35s ease; }
+  #plabel { display: block; margin-top: 5px; color: #c9ccd1; font-size: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 </head>
 <body>
@@ -55,11 +63,13 @@ export function buildViewerHtml(): string {
   <canvas id="c"></canvas>
   <div id="fallback"><img id="png" alt="model preview" /></div>
   <div id="status">Waiting for a model — run the view_model tool.</div>
+  <div id="progress"><div id="track"><div id="pbar"></div></div><span id="plabel"></span></div>
   <div id="bar">
     <span id="name">No model loaded</span>
     <span id="stats"></span>
-    <button id="dlStl" disabled>Download STL</button>
-    <button id="dlPng" disabled>Download PNG</button>
+    <button id="repairBtn" disabled title="Solidify via VAR2 STL repair, then save to disk">Repair &amp; Save STL</button>
+    <button id="dlStl" disabled title="Save the STL to disk (as-is)">Save STL</button>
+    <button id="dlPng" disabled title="Save the PNG preview to disk">Save PNG</button>
   </div>
 </div>
 <script>
@@ -71,8 +81,18 @@ export function buildViewerHtml(): string {
   var statsEl = document.getElementById('stats');
   var fallbackEl = document.getElementById('fallback');
   var pngEl = document.getElementById('png');
+  var repairBtn = document.getElementById('repairBtn');
   var dlStl = document.getElementById('dlStl');
   var dlPng = document.getElementById('dlPng');
+  var progressEl = document.getElementById('progress');
+  var pbar = document.getElementById('pbar');
+  var plabel = document.getElementById('plabel');
+
+  // Base URL of the local HTTP server (baked in only in HTTP mode). The sandboxed
+  // iframe can't download a file, so the buttons POST to the server, which writes
+  // to disk / runs the repair Space. Empty in stdio mode -> buttons stay disabled.
+  var BASE_URL = ${JSON.stringify(process.env.OPENSCAD_MCP_BASE_URL ?? "")};
+  var currentId = null;
 
   var pending = null;   // model that arrived before the renderer was ready
   var render3D = null;  // set if WebGL initialised
@@ -82,12 +102,56 @@ export function buildViewerHtml(): string {
     for (var i = 0; i < n; i++) bytes[i] = bin.charCodeAt(i);
     return bytes;
   }
-  function downloadBytes(name, mime, bytes) {
-    var blob = new Blob([bytes], { type: mime });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a'); a.href = url; a.download = name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+  function setProgress(pct, label) {
+    progressEl.classList.add('on');
+    pbar.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
+    plabel.textContent = label || '';
+    reportSize();
+  }
+  function endProgress(finalLabel) {
+    plabel.textContent = finalLabel || '';
+    setTimeout(function () { progressEl.classList.remove('on'); pbar.style.width = '0%'; reportSize(); }, finalLabel ? 7000 : 0);
+  }
+  function postJson(route, payload) {
+    return fetch(BASE_URL + route, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+  }
+  function saveAsset(kind) {
+    if (!BASE_URL || !currentId) return;
+    setProgress(35, 'Saving ' + kind.toUpperCase() + '…');
+    postJson('/save', { id: currentId, kind: kind }).then(function (r) { return r.json(); }).then(function (j) {
+      setProgress(100, '');
+      endProgress(j && j.path ? ('Saved to ' + j.path) : ('Save failed: ' + ((j && j.error) || 'unknown')));
+    }, function (e) { endProgress('Save failed: ' + e.message); });
+  }
+  function repairAndSave() {
+    if (!BASE_URL || !currentId) return;
+    repairBtn.disabled = true;
+    setProgress(2, 'Starting repair…');
+    postJson('/repair', { id: currentId, quality: 'standard' }).then(function (resp) {
+      if (!resp.body) throw new Error('HTTP ' + resp.status);
+      var reader = resp.body.getReader(), dec = new TextDecoder(), buf = '', savedPath = null, errMsg = null;
+      function pump() {
+        return reader.read().then(function (rr) {
+          if (rr.done) return;
+          buf += dec.decode(rr.value, { stream: true });
+          var nl;
+          while ((nl = buf.indexOf('\\n')) >= 0) {
+            var line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+            if (!line) continue;
+            var ev; try { ev = JSON.parse(line); } catch (e) { continue; }
+            if (ev.type === 'error') errMsg = ev.error;
+            else if (ev.type === 'saved') { savedPath = ev.path; setProgress(100, 'Repaired'); }
+            else if (ev.type === 'progress') setProgress(ev.percent || 0, (ev.stage || '') + (ev.message ? ' — ' + ev.message : ''));
+          }
+          return pump();
+        });
+      }
+      return pump().then(function () {
+        endProgress(savedPath ? ('Saved repaired STL to ' + savedPath) : ('Repair failed: ' + (errMsg || 'no result')));
+      });
+    }).catch(function (e) { endProgress('Repair failed: ' + e.message); }).then(function () { repairBtn.disabled = false; });
   }
   function gunzip(bytes) {
     if (typeof DecompressionStream === 'undefined') return Promise.reject(new Error('gzip unsupported here'));
@@ -111,15 +175,20 @@ export function buildViewerHtml(): string {
     if (!model) return;
     nameEl.textContent = model.name || 'model';
     statsEl.textContent = model.stats || '';
-    if (model.pngBase64) {
-      dlPng.disabled = false;
-      dlPng.onclick = function () { downloadBytes((model.name || 'model') + '.png', 'image/png', b64ToBytes(model.pngBase64)); };
-    }
+    currentId = model.modelId || null;
+
+    // The iframe can't download; buttons POST to the local server (HTTP mode),
+    // which saves to disk / runs the repair Space.
+    var canServer = !!BASE_URL && !!currentId;
+    repairBtn.disabled = !canServer;
+    dlStl.disabled = !canServer;
+    dlPng.disabled = !(canServer && model.pngBase64);
+    repairBtn.onclick = repairAndSave;
+    dlStl.onclick = function () { saveAsset('stl'); };
+    dlPng.onclick = function () { saveAsset('png'); };
+    if (!BASE_URL) statsEl.textContent = (model.stats ? model.stats + ' · ' : '') + 'run start:http to enable save/repair';
+
     stlBufferOf(model).then(function (stlBuf) {
-      if (stlBuf) {
-        dlStl.disabled = false;
-        dlStl.onclick = function () { downloadBytes((model.name || 'model') + '.stl', 'model/stl', stlBuf); };
-      }
       if (stlBuf && render3D) {
         try {
           render3D(stlBuf);
@@ -129,7 +198,7 @@ export function buildViewerHtml(): string {
         pending = model; // renderer not ready yet
       } else {
         showPng(model.pngBase64, model.meshOmitted
-          ? ('Model too large for inline 3D (' + (model.tris || '?') + ' triangles) — showing image. Use export_model to download the STL.')
+          ? ('Model too large for inline 3D (' + (model.tris || '?') + ' triangles) — showing image.')
           : (model.pngBase64 ? '' : 'Model has no preview data.'));
       }
     }, function (e) {

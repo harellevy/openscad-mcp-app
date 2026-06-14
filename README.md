@@ -110,6 +110,20 @@ Then in Claude Desktop / claude.ai: **Settings → Connectors → Add custom con
 `http://localhost:3333/mcp`. Over stdio you still get tools + the PNG preview; over HTTP you get the
 inline interactive viewer. (Run only one at a time to avoid two servers competing.)
 
+### Viewer download / repair buttons
+
+A sandboxed MCP-App iframe can't download a file directly, so the viewer's buttons POST to the local
+HTTP server, which writes to disk (`OPENSCAD_MCP_EXPORT_DIR`):
+
+- **Save STL** / **Save PNG** — writes the model/preview to the exports dir.
+- **Repair & Save STL** — sends the model through the [VAR2 STL-repair Space](https://huggingface.co/spaces/var2/stl-repair)
+  (STL → GLB → watertight, 3D-print-ready solid STL), showing its 10-stage progress bar, then saves the
+  repaired STL. The Space URL is configurable via `STL_REPAIR_URL` (default the public Space).
+  Note: voxel-repair is built for triangle-soup meshes — on an already-solid OpenSCAD part it rounds
+  edges and decimates, so use **Save STL** when you want the exact CAD geometry.
+
+These buttons require HTTP mode (they're disabled over stdio).
+
 ## The iteration loop
 
 1. Ask for a model ("design a parametric enclosure for a 60×40 mm PCB").
